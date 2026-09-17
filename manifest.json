@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "pix.recast",
+  "name": "Better Recast",
+  "version": "1.0.0",
+  "author": "pixllbeat",
+  "license": "MIT",
+  "description": "GPU-accelerated screen recording with automatic hardware detection",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Better Recast",
+    "description": "Record, pause, and manage GPU screen recordings",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

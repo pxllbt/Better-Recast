@@ -1,0 +1,594 @@
+pragma ComponentBehavior: Bound
+
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import "Config.js" as Config
+import "GpuProbe.js" as GpuProbe
+
+// pix.recast service — owns gpu-screen-recorder lifecycle, GPU detection, config
+// persistence and the IPC socket used for pause/resume/stop.
+Item {
+    id: root
+
+    // Host-injected
+    property var shell: null
+    property var manifest: null
+    property var pluginRegistry: null
+    property string omarchyPath: ""
+
+    // ── Hardware / environment ──
+    property var gpuInfo: ({
+            vendor: "unknown",
+            cardPath: "",
+            codecs: [],
+            backend: "cpu"
+        })
+    property bool gpuDetected: false
+    property var monitors: []
+    property bool monitorsLoaded: false
+    property var audioDevices: []
+    property bool audioDevicesLoaded: false
+
+    // ── Config (defaults seeded, then shell.json overrides) ──
+    property var config: Config.normalize({})
+    property bool configLoaded: false
+    // True while we are persisting our own write to shell.json so the FileView
+    // reload (onFileChanged) can skip re-reading a buffer that may still lag the
+    // disk write — otherwise the in-memory config we just updated gets reverted,
+    // which is why settings like mode sometimes need two toggles to stick.
+    property bool _configSelfWrite: false
+
+    // ── Recording state ──
+    property string state: "idle" // idle | starting | recording | paused | stopping | error
+    // Alias so the bar widget / panel can read the recording state uniformly.
+    property string recordingState: state
+    property bool recordingIsStream: false
+    property string recordingFile: ""
+    property string recordingPath: ""
+    property int recordingPid: 0
+    property int recordingElapsed: 0
+    property int recordingBaseSec: 0
+    property double recordingBaseMs: 0
+    property string lastTarget: ""      // for panel display / notification
+    property string pendingRegion: ""   // set by pickRegion before start
+    property string errorMessage: ""
+
+    readonly property bool active: state === "recording" || state === "paused"
+    readonly property bool paused: state === "paused"
+    readonly property bool busy: state === "starting" || state === "stopping"
+
+    // ── Paths ──
+    readonly property string runtimeDir: {
+        var xdg = Quickshell.env("XDG_RUNTIME_DIR");
+        if (!xdg || xdg.length === 0)
+            xdg = "/tmp";
+        return xdg + "/px-gsr";
+    }
+    readonly property string ipcSocketPath: runtimeDir + "/ipc.sock"
+    readonly property string stateFilePath: runtimeDir + "/state.txt"
+    readonly property string recordingStateFilePath: "/tmp/omarchy-screenrecord-filename"
+    readonly property string ipcScriptPath: {
+        // Resolve relative to this plugin's source directory.
+        var url = Qt.resolvedUrl("scripts/gsr-ipc.py");
+        var s = String(url);
+        if (s.indexOf("file://") === 0)
+            s = s.substring(7);
+        try {
+            s = decodeURIComponent(s);
+        } catch (e) {}
+        return s;
+    }
+    readonly property string configFilePath: {
+        var home = Quickshell.env("HOME");
+        if (!home)
+            home = "/";
+        return home + "/.config/omarchy/shell.json";
+    }
+    readonly property string outputDir: {
+        var dir = config.outputDir || "";
+        if (dir)
+            return dir;
+        var xdgVideos = Quickshell.env("XDG_VIDEOS_DIR");
+        if (xdgVideos)
+            return xdgVideos;
+        var home = Quickshell.env("HOME");
+        return home ? home + "/Videos" : "/tmp";
+    }
+
+    // ── Startup ──
+    Component.onCompleted: {
+        mkdirs.command = ["bash", "-c", "mkdir -p " + runtimeDir];
+        mkdirs.running = true;
+        refreshGpuInfo();
+        refreshMonitors();
+        refreshConfig();
+    }
+
+    // ── Public API (used by BarWidget / Panel) ──
+
+    function refreshGpuInfo() {
+        gsrInfoProc.command = ["gpu-screen-recorder", "--info"];
+        gsrInfoProc.running = true;
+    }
+
+    function refreshMonitors() {
+        listMonitorsProc.command = ["gpu-screen-recorder", "--list-monitors"];
+        listMonitorsProc.running = true;
+    }
+
+    function refreshAudioDevices() {
+        listAudioProc.command = ["gpu-screen-recorder", "--list-audio-devices"];
+        listAudioProc.running = true;
+    }
+
+    function toggle() {
+        if (active) {
+            stop();
+        } else if (busy) {
+            // ignore
+        } else {
+            start("auto");
+        }
+    }
+
+    function start(targetType) {
+        if (active || busy)
+            return;
+        errorMessage = "";
+
+        var streamMode = config.mode === "stream";
+
+        var target = resolveTarget(targetType);
+        if (!target) {
+            if (config.targetMode === "region" || targetType === "region") {
+                pickRegion();
+                return;
+            }
+            errorMessage = "No capture target available";
+            state = "error";
+            return;
+        }
+
+        var args = Config.encodeGsrArgs(config, gpuInfo, target, streamMode);
+        recordingIsStream = streamMode;
+
+        if (streamMode) {
+            // gsr streams the compositor capture to any RTMP/WHIP URL passed to -o.
+            var streamUrl = Config.streamOutput(config);
+            if (!streamUrl) {
+                recordingIsStream = false;
+                errorMessage = "Set a stream URL and key to go live";
+                state = "error";
+                return;
+            }
+            args = args.concat(["-o", streamUrl, "-ipc", ipcSocketPath]);
+            if (config.streamBackupLocal) {
+                args = args.concat(["-ro", outputDir]);
+            }
+            recordingFile = "";
+            lastTarget = describeTarget(target) + " · " + config.streamPlatform;
+            state = "starting";
+            recordingElapsed = 0;
+            gsr.command = ["gpu-screen-recorder"].concat(args);
+            gsr.running = true;
+            // Ensure the IPC socket dir (and the output dir when a local copy is
+            // requested) exists before the recorder starts.
+            prepareDir.command = ["bash", "-c", "mkdir -p " + outputDir + " && mkdir -p " + runtimeDir];
+            prepareDir.running = true;
+            return;
+        }
+
+        // Try to start; if hardware is missing, surface a friendly error.
+        args = Config.encodeGsrArgs(config, gpuInfo, target);
+        recordingFile = outputDir + "/screenrecording-" + Config.makeTimestamp() + "." + (config.container || "mp4");
+        args = args.concat(["-o", recordingFile, "-ipc", ipcSocketPath]);
+        args.unshift("gpu-screen-recorder");
+
+        // ensure output dir + runtime state
+        prepareDir.command = ["bash", "-c", "mkdir -p " + outputDir + " && mkdir -p " + runtimeDir];
+        prepareDir.running = true;
+
+        lastTarget = describeTarget(target);
+        state = "starting";
+        recordingElapsed = 0;
+        gsr.command = args;
+        gsr.running = true;
+
+        // compatibility marker for stock pyxis indicators
+        writeMarker.command = ["bash", "-c", "mkdir -p " + runtimeDir + " && printf '%s\n' '" + recordingFile + "' > " + recordingStateFilePath + " && printf '%s\n' '" + String(lastTarget) + "' > " + stateFilePath];
+        writeMarker.running = true;
+    }
+
+    function pickRegion() {
+        regionPicker.command = ["omarchy-capture-region", "smart", "--match-monitor"];
+        regionPicker.running = true;
+    }
+
+    function stop() {
+        if (!active) {
+            if (state === "starting" || state === "stopping")
+                return;
+        }
+        if (state === "starting")
+            state = "stopping";
+        state = "stopping";
+        stopTimeout.restart();
+        if (gsr.running) {
+            // Try graceful stop over the IPC socket; fall back to SIGINT.
+            ipcStop.command = ["python3", ipcScriptPath, ipcSocketPath, "stop"];
+            ipcStop.running = true;
+        }
+    }
+
+    // Immediate stop for tests / emergency — sends SIGINT to the recorder.
+    function kill() {
+        if (gsr.running)
+            gsr.signal(2); // SIGINT
+    }
+
+    function pause() {
+        if (state !== "recording")
+            return;
+        ipcPause.command = ["python3", ipcScriptPath, ipcSocketPath, "set-paused", "true"];
+        ipcPause.running = true;
+    }
+
+    function resume() {
+        if (state !== "paused")
+            return;
+        ipcResume.command = ["python3", ipcScriptPath, ipcSocketPath, "set-paused", "false"];
+        ipcResume.running = true;
+    }
+
+    function togglePause() {
+        if (state === "recording")
+            pause();
+        else if (state === "paused")
+            resume();
+    }
+
+    function setConfig(key, value) {
+        var copy = Object.assign({}, config);
+        copy[key] = value;
+        config = Config.normalize(copy);
+        persistConfig();
+    }
+
+    // Update config in memory only — never persist. Used for session-scoped
+    // stream credentials while `streamRemember` is off.
+    function setSessionConfig(key, value) {
+        if (!config)
+            return;
+        var copy = Object.assign({}, config);
+        copy[key] = value;
+        config = Config.normalize(copy);
+    }
+
+    function persistConfig() {
+        if (!shell || typeof shell.updateEntryInline !== "function")
+            return;
+        var entries = {};
+        for (var k in config) {
+            // Session-only stream key must never land in shell.json unless the
+            // user explicitly asked to remember it.
+            if (k === "streamKey" && config.streamRemember !== true)
+                continue;
+            entries[k] = config[k];
+        }
+        var wrote = shell.updateEntryInline("pix.recast", entries);
+        if (wrote)
+            root._configSelfWrite = true;
+    }
+
+    function refreshConfig() {
+        configFileView.reload();
+    }
+
+    function effective(cfg) {
+        return Config.applyGpuProfile(cfg || config, gpuInfo);
+    }
+
+    // ── Internals ──
+
+    function resolveTarget(targetType) {
+        var mode = targetType && targetType !== "auto" ? targetType : config.targetMode;
+        if (mode === "region") {
+            var geom = pendingRegion || config.region || config._lastRegion || "";
+            if (!geom)
+                return null;
+            return {
+                type: "region",
+                geometry: geom
+            };
+        }
+        if (mode === "monitor") {
+            var name = config.monitorName || config._lastMonitor || "";
+            if (!name && monitors.length > 0)
+                name = monitors[0] && monitors[0].name || "";
+            if (!name)
+                return null;
+            return {
+                type: "monitor",
+                name: name
+            };
+        }
+        return {
+            type: "portal"
+        };
+    }
+
+    function describeTarget(target) {
+        if (target.type === "monitor")
+            return "Monitor: " + target.name;
+        if (target.type === "region")
+            return "Region: " + target.geometry;
+        return "Window / portal";
+    }
+
+    function parseAppliedConfig(text) {
+        var obj = null;
+        try {
+            obj = JSON.parse(text);
+        } catch (e) {
+            return false;
+        }
+
+        var found = null;
+        if (obj && obj.bar && obj.bar.layout) {
+            var sections = ["left", "center", "right"];
+            for (var s = 0; s < sections.length; s++) {
+                var arr = obj.bar.layout[sections[s]] || [];
+                for (var i = 0; i < arr.length; i++) {
+                    if (arr[i] && arr[i].id === "pix.recast") {
+                        found = arr[i];
+                        break;
+                    }
+                }
+                if (found)
+                    break;
+            }
+        }
+        if (!found && obj && Array.isArray(obj.plugins)) {
+            for (var j = 0; j < obj.plugins.length; j++) {
+                if (obj.plugins[j] && obj.plugins[j].id === "pix.recast") {
+                    found = obj.plugins[j];
+                    break;
+                }
+            }
+        }
+        if (!found)
+            return false;
+
+        var merged = Object.assign({}, Config.defaultConfig());
+        for (var k in found) {
+            if (k === "id" || k === "__type")
+                continue;
+            merged[k] = found[k];
+        }
+        config = Config.normalize(merged);
+        configLoaded = true;
+        return true;
+    }
+
+    function onRecordingSaved() {
+        var wasStream = recordingIsStream;
+        var saved = recordingFile;
+        recordingFile = "";
+        recordingIsStream = false;
+        state = "idle";
+        clearMarkerProc.command = ["bash", "-c", "rm -f " + recordingStateFilePath + " " + stateFilePath];
+        clearMarkerProc.running = true;
+        if (wasStream) {
+            sendNotification("Stream ended", "Your live stream has stopped.", "normal", 10000);
+        } else if (saved) {
+            sendNotification("Screen recording saved", saved, "normal", 10000);
+        }
+    }
+
+    function onRecordingFailed(msg) {
+        errorMessage = msg;
+        var wasStream = recordingIsStream;
+        var saved = recordingFile;
+        recordingFile = "";
+        recordingIsStream = false;
+        state = "idle";
+        clearMarkerProc.command = ["bash", "-c", "rm -f " + recordingStateFilePath + " " + stateFilePath];
+        clearMarkerProc.running = true;
+        sendNotification(wasStream ? "Stream ended unexpectedly" : "Screen recording failed", msg, "critical", 8000);
+    }
+
+    function sendNotification(summary, body, urgency, timeout) {
+        var cmd = ["omarchy-notification-send"];
+        if (urgency)
+            cmd.push("-u", urgency);
+        if (timeout)
+            cmd.push("-t", String(timeout));
+        cmd = cmd.concat([summary, body]);
+        notifProc.command = cmd;
+        notifProc.running = true;
+    }
+
+    // ── FileView: watch shell.json for external config edits ──
+    FileView {
+        id: configFileView
+        path: root.configFilePath
+        blockAllReads: false
+        watchChanges: true
+        onLoaded: root.refreshConfig()
+        onLoadFailed: root.refreshConfig()
+        onFileChanged: {
+            if (root._configSelfWrite) {
+                root._configSelfWrite = false;
+                return;
+            }
+            root.refreshConfig();
+        }
+
+        function reload() {
+            var text = configFileView.text();
+            if (!text) {
+                var fallback = Config.defaultConfig();
+                root.config = Config.normalize(fallback);
+                root.configLoaded = true;
+                return;
+            }
+            root.parseAppliedConfig(text);
+        }
+    }
+
+    // ── Processes ──
+
+    Process {
+        id: gsrInfoProc
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                root.gpuInfo = GpuProbe.parseGsrInfo(text);
+                root.gpuDetected = true;
+                var effective = Config.applyGpuProfile(root.config, root.gpuInfo);
+                root.config = Config.normalize(effective);
+            }
+        }
+    }
+
+    Process {
+        id: listMonitorsProc
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                root.monitors = GpuProbe.parseMonitorList(text);
+                root.monitorsLoaded = true;
+            }
+        }
+    }
+
+    Process {
+        id: listAudioProc
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                root.audioDevices = GpuProbe.parseAudioDevices(text);
+                root.audioDevicesLoaded = true;
+            }
+        }
+    }
+
+    Process {
+        id: gsr
+        running: false
+        // gsr has no "started" signal; promote starting -> recording as soon as the
+        // process is alive. A launch that dies instantly is caught by onExited.
+        onRunningChanged: {
+            if (gsr.running && root.state === "starting")
+                root.state = "recording";
+        }
+        onExited: function (exitCode, exitStatus) {
+            stopTimeout.stop();
+            if (root.state === "stopping") {
+                root.onRecordingSaved();
+            } else if (root.state === "starting" || root.state === "recording" || root.state === "paused") {
+                root.onRecordingFailed("gpu-screen-recorder exited unexpectedly (code " + exitCode + ")");
+            } else {
+                root.state = "idle";
+            }
+        }
+    }
+
+    Process {
+        id: ipcStop
+    }
+    Process {
+        id: ipcPause
+    }
+    Process {
+        id: ipcResume
+    }
+
+    Process {
+        id: regionPicker
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var out = text.trim();
+                if (!out || out === "cancelled" || out === "null") {
+                    root.pendingRegion = "";
+                    return;
+                }
+                // Expected output: "WIDTHxHEIGHT+X+Y" (omarchy-capture-region fmt)
+                if (out.match(/^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/)) {
+                    root.pendingRegion = out;
+                    root.setConfig("_lastRegion", out);
+                } else {
+                    // slurry format "X,Y WxH"
+                    var m = out.match(/^(-?[0-9]+),(-?[0-9]+)\s+([0-9]+)x([0-9]+)$/);
+                    if (m) {
+                        var geom = m[3] + "x" + m[4] + "+" + m[1] + "+" + m[2];
+                        root.pendingRegion = geom;
+                        root.setConfig("_lastRegion", geom);
+                    }
+                }
+            }
+        }
+        onExited: function (exitCode) {
+            if (exitCode !== 0 && root.pendingRegion === "") {
+                root.errorMessage = "Region selection was cancelled";
+            }
+        }
+    }
+
+    Process {
+        id: prepareDir
+    }
+    Process {
+        id: writeMarker
+    }
+    Process {
+        id: clearMarkerProc
+    }
+    Process {
+        id: mkdirs
+    }
+    Process {
+        id: notifProc
+    }
+
+    // Fallback when the IPC stop didn't terminate the recorder: SIGINT is
+    // graceful (finalizes the file) and does not require the socket to reply.
+    Process {
+        id: fallbackStop
+    }
+
+    Timer {
+        id: stopTimeout
+        interval: 6000
+        onTriggered: {
+            if (gsr.running) {
+                fallbackStop.command = ["bash", "-c", "pkill -INT -x gpu-screen-reco || true"];
+                fallbackStop.running = true;
+            }
+        }
+    }
+
+    // State transition bookkeeping
+    onStateChanged: {
+        if (state === "recording") {
+            recordingBaseSec = recordingElapsed;
+            recordingBaseMs = Date.now();
+        }
+    }
+
+    // Elapsed timer (only while recording)
+    Timer {
+        id: elapsedTimer
+        interval: 1000
+        running: root.state === "recording"
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: {
+            if (root.state === "recording") {
+                root.recordingElapsed = root.recordingBaseSec + Math.floor((Date.now() - root.recordingBaseMs) / 1000);
+            }
+        }
+    }
+}

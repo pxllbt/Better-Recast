@@ -1,0 +1,5 @@
+*.qmlc
+*.jsc
+__pycache__/
+*.pyc
+.qqc_caches/
