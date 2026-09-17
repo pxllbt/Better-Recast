@@ -4,6 +4,8 @@ GPU-accelerated screen recording for the Omarchy shell, backed by
 [gpu-screen-recorder](https://git.dec05eba.com/gpu-screen-recorder/about/) with
 automatic hardware and encoder detection.
 
+![Better Recast preview](assets/previews/preview.mp4)
+
 ## Features
 
 - One-click record/stop from the bar widget (left click toggle, right click panel)
