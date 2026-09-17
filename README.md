@@ -1,4 +1,4 @@
-# Better Recast — GPU Screen Recording plugin for Omarchy Quattro
+# Better Recast — GPU Screen Recording Plugin for Omarchy
 
 GPU-accelerated screen recording for the Omarchy shell, backed by
 [gpu-screen-recorder](https://git.dec05eba.com/gpu-screen-recorder/about/) with
