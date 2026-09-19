@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import Quickshell.Io
 import qs.Ui
 import qs.Commons
 import "Config.js" as Config
@@ -26,6 +27,34 @@ Panel {
     property var shell: null
     property var manifest: null
     property var service: null
+    property var serviceState: ({})
+    // Optimistic override for config keys set while the service is unreachable.
+    // Cleared when the state file is next polled and confirms the change.
+    property var _pendingConfig: ({})
+    // Only clear pending config when the state file has caught up to our
+    // optimistic change — otherwise the UI flickers back between the
+    // optimistic update and the 2 s poll interval.
+    function _clearPendingIfConfirmed() {
+        if (!root.serviceState || !root.serviceState.config)
+            return;
+        var allConfirmed = true;
+        for (var k in root._pendingConfig) {
+            if (root.serviceState.config[k] !== root._pendingConfig[k]) {
+                allConfirmed = false;
+                break;
+            }
+        }
+        if (allConfirmed)
+            root._pendingConfig = ({});
+    }
+    // Error message: pulled from the live service, the state file, or set
+    // locally for fallback-path errors (e.g. region picker cancelled).
+    property string _localError: ""
+    readonly property string errorMessage: root.service
+        ? (root.service.errorMessage || "")
+        : (root.serviceState
+            ? (root.serviceState.errorMessage || root._localError || "")
+            : root._localError)
     property var anchorItem: null
     property var hostWidget: null
     property string omarchyPath: ""
@@ -38,23 +67,66 @@ Panel {
     readonly property color urgent: Color.urgent
     readonly property string fontFamily: Style.font.family
 
-    readonly property var cfg: {
+    // Effective config: live service config → state file config (with optimistic
+    // overrides) → settings → defaults
+    // Using a mutable property allows us to force re-evaluation via the
+    // handlers below, working around Qt 6's QML engine not always
+    // re-evaluating complex readonly property var bindings.
+    property var cfg: root._computeCfg()
+
+    function _computeCfg() {
         if (root.service && root.service.config)
             return root.service.config;
+        var base = {};
+        if (root.serviceState && root.serviceState.config)
+            base = root.serviceState.config;
         if (root.settings && typeof root.settings === "object")
-            return root.settings;
-        return Config.defaultConfig();
+            base = Object.assign({}, base, root.settings);
+        if (Object.keys(base).length === 0)
+            base = Config.defaultConfig();
+        if (Object.keys(root._pendingConfig).length > 0) {
+            var merged = Object.assign({}, base);
+            for (var k in root._pendingConfig)
+                merged[k] = root._pendingConfig[k];
+            return merged;
+        }
+        return base;
     }
 
-    readonly property var gpu: root.service ? (root.service.gpuInfo || {}) : {
-        vendor: "unknown",
-        codecs: []
+    onServiceChanged: {
+        root.cfg = root._computeCfg();
     }
-    readonly property string state: root.service ? (root.service.recordingState || root.service.state || "idle") : "idle"
+    onSettingsChanged: {
+        root.cfg = root._computeCfg();
+    }
+    onServiceStateChanged: {
+        root._clearPendingIfConfirmed();
+        root.cfg = root._computeCfg();
+    }
+
+    Connections {
+        target: root.service
+        ignoreUnknownSignals: true
+        onConfigChanged: {
+            root.cfg = root._computeCfg();
+        }
+    }
+
+    // GPU info: live service → state file → defaults
+    readonly property var gpu: root.service
+        ? (root.service.gpuInfo || {})
+        : (root.serviceState && root.serviceState.gpuInfo
+            ? root.serviceState.gpuInfo
+            : { vendor: "unknown", codecs: [] })
+    readonly property string state: root.service
+        ? (root.service.recordingState || root.service.state || "idle")
+        : (root.serviceState && (root.serviceState.recordingState || root.serviceState.state) || "idle")
     readonly property bool recording: state === "recording" || state === "paused"
     readonly property bool paused: state === "paused"
     readonly property bool busy: state === "starting" || state === "stopping"
-    readonly property bool isStream: (root.cfg.mode || "record") === "stream"
+    readonly property bool isStream: root.service && root.service.config
+        ? root.service.config.mode === "stream"
+        : (root.cfg && root.cfg.mode === "stream")
 
     function formatElapsed(sec) {
         var h = Math.floor(sec / 3600);
@@ -69,10 +141,13 @@ Panel {
     function stateLabel() {
         if (state === "recording") {
             var kind = root.isStream ? "LIVE" : "REC";
-            return kind + " " + formatElapsed(root.service ? (root.service.recordingElapsed || 0) : 0);
+            var elapsed = root.service ? (root.service.recordingElapsed || 0) : (root.serviceState.recordingElapsed || 0);
+            return kind + " " + formatElapsed(elapsed);
         }
-        if (state === "paused")
-            return "PAUSED " + formatElapsed(root.service ? (root.service.recordingElapsed || 0) : 0);
+        if (state === "paused") {
+            var elapsed2 = root.service ? (root.service.recordingElapsed || 0) : (root.serviceState.recordingElapsed || 0);
+            return "PAUSED " + formatElapsed(elapsed2);
+        }
         if (state === "starting")
             return "STARTING…";
         if (state === "stopping")
@@ -100,6 +175,8 @@ Panel {
         if (root.service && root.service.config && root.service.config.encoder) {
             return root.service.config.encoder;
         }
+        if (root.serviceState && root.serviceState.config && root.serviceState.config.encoder)
+            return root.serviceState.config.encoder;
         var eff = Config.applyGpuProfile(root.cfg, root.gpu);
         return eff.encoder || "gpu";
     }
@@ -110,6 +187,8 @@ Panel {
         if (root.service && root.service.config && root.service.config.codec && root.service.config.codec !== "auto") {
             return root.service.config.codec;
         }
+        if (root.serviceState && root.serviceState.config && root.serviceState.config.codec && root.serviceState.config.codec !== "auto")
+            return root.serviceState.config.codec;
         var eff = Config.applyGpuProfile(root.cfg, root.gpu);
         return eff.codec || "h264";
     }
@@ -120,6 +199,8 @@ Panel {
         if (root.service && root.service.config && root.service.config.quality && root.service.config.quality !== "auto") {
             return root.service.config.quality;
         }
+        if (root.serviceState && root.serviceState.config && root.serviceState.config.quality && root.serviceState.config.quality !== "auto")
+            return root.serviceState.config.quality;
         var eff = Config.applyGpuProfile(root.cfg, root.gpu);
         return eff.quality || "very_high";
     }
@@ -133,7 +214,8 @@ Panel {
 
     function monitorOptions() {
         var list = [];
-        var ms = root.service ? (root.service.monitors || []) : [];
+        var ms = root.service ? (root.service.monitors || [])
+            : (root.serviceState ? (root.serviceState.monitors || []) : []);
         for (var i = 0; i < ms.length; i++) {
             list.push({
                 value: ms[i].name,
@@ -146,16 +228,32 @@ Panel {
     function setConfig(key, value) {
         if (root.service && typeof root.service.setConfig === "function") {
             root.service.setConfig(key, value);
-        } else if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function") {
-            var entry = {
-                id: "pix.recast"
-            };
-            for (var k in root.settings)
-                if (k !== "id")
-                    entry[k] = root.settings[k];
-            entry[key] = value;
-            root.bar.shell.updateEntryInline("pix.recast", entry);
+            return;
         }
+        // Try the bar shell's updateEntryInline — this only works for the
+        // built-in omarchy.bar because the scoped PluginShellApi resolves the
+        // service and writes to shell.json directly. For replacement bars
+        // (px.bar) the scoped API exists but updateEntryInline silently
+        // returns false because it only accepts the bar widget's own plugin ID.
+        if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function") {
+            var entry = { id: "pix.recast" };
+            var cfg = root.cfg || Config.defaultConfig();
+            for (var k in cfg)
+                if (k !== "id")
+                    entry[k] = cfg[k];
+            entry[key] = value;
+            if (root.bar.shell.updateEntryInline("pix.recast", entry))
+                return;
+        }
+        // IPC fallback for replacement bars (px.bar): no service access,
+        // so write the config change into the state file via IPC.
+        configIpcProc.running = false;
+        configIpcProc.command = ["omarchy-shell", "px-recast", "config", key, String(value)];
+        configIpcProc.running = true;
+        // Optimistically update local state so the UI responds immediately.
+        var next = Object.assign({}, root._pendingConfig);
+        next[key] = value;
+        root._pendingConfig = next;
     }
 
     // Stream URL/key are session-only unless "remember" is on, so the key never
@@ -166,6 +264,13 @@ Panel {
                 root.service.setConfig(key, value);
             else if (typeof root.service.setSessionConfig === "function")
                 root.service.setSessionConfig(key, value);
+            else if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function") {
+                var entry = { id: "pix.recast" };
+                for (var k in root.settings)
+                    if (k !== "id") entry[k] = root.settings[k];
+                entry[key] = value;
+                root.bar.shell.updateEntryInline("pix.recast", entry);
+            }
             else
                 root.service.setConfig(key, value);
         } else if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function") {
@@ -214,8 +319,30 @@ Panel {
     }
 
     function toggleRecording() {
-        if (root.service)
+        if (root.service && typeof root.service.toggle === "function") {
             root.service.toggle();
+        } else {
+            toggleIpcAction.command = ["omarchy-shell", "px-recast", "toggle"];
+            toggleIpcAction.running = true;
+        }
+    }
+
+    function pauseRecording() {
+        if (root.service && typeof root.service.pause === "function") {
+            root.service.pause();
+        } else {
+            ipcActionProc.command = ["omarchy-shell", "px-recast", "pause"];
+            ipcActionProc.running = true;
+        }
+    }
+
+    function resumeRecording() {
+        if (root.service && typeof root.service.resume === "function") {
+            root.service.resume();
+        } else {
+            ipcActionProc.command = ["omarchy-shell", "px-recast", "resume"];
+            ipcActionProc.running = true;
+        }
     }
 
     // Popup is driven by the qs.Ui Panel base: open()/close()/toggle()/opened
@@ -355,17 +482,16 @@ Panel {
                             id: pauseButton
                             text: root.paused ? "Resume" : "Pause"
                             onClicked: {
-                                if (root.service) {
-                                    if (root.paused)
-                                        root.service.resume();
-                                    else
-                                        root.service.pause();
-                                }
+                                if (root.paused)
+                                    root.resumeRecording();
+                                else
+                                    root.pauseRecording();
                             }
                         }
 
                         Text {
-                            text: root.service && root.service.recordingFile ? "Saving to:\n" + root.service.recordingFile : ""
+                            text: (root.service && root.service.recordingFile) ? "Saving to:\n" + root.service.recordingFile
+                                : (root.serviceState && root.serviceState.recordingFile ? "Saving to:\n" + root.serviceState.recordingFile : "")
                             color: root.muted
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.caption
@@ -396,8 +522,8 @@ Panel {
                     }
 
                     Text {
-                        visible: root.state === "error" && root.service && root.service.errorMessage
-                        text: "Error: " + (root.service ? root.service.errorMessage : "")
+                visible: root.state === "error" && root.errorMessage.length > 0
+                text: "Error: " + root.errorMessage
                         color: root.urgent
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
@@ -494,8 +620,12 @@ Panel {
                             Button {
                                 text: root.cfg._lastRegion ? "Re-pick region" : "Pick region"
                                 onClicked: {
-                                    if (root.service)
+                                    if (root.service && typeof root.service.pickRegion === "function")
                                         root.service.pickRegion();
+                                    else {
+                                        fallbackRegionPicker.command = ["omarchy-capture-region", "smart", "--match-monitor"];
+                                        fallbackRegionPicker.running = true;
+                                    }
                                 }
                             }
 
@@ -927,7 +1057,8 @@ Panel {
                                 accent: root.accent
                                 font.family: root.fontFamily
                                 font.pixelSize: Style.font.caption
-                                placeholderText: root.service ? root.service.outputDir : ""
+                                placeholderText: root.service ? root.service.outputDir
+                                    : (root.serviceState ? (root.serviceState.outputDir || "") : "")
                                 onEditingFinished: root.setConfig("outputDir", text)
                             }
                         }
@@ -1138,12 +1269,16 @@ Panel {
                                 if (root.service) {
                                     root.service.refreshGpuInfo();
                                     root.service.refreshMonitors();
+                                } else {
+                                    ipcActionProc.command = ["omarchy-shell", "px-recast", "refreshGpu"];
+                                    ipcActionProc.running = true;
                                 }
                             }
                         }
 
                         Text {
-                            text: root.service && root.service.gpuDetected ? "Detected" : "Detecting…"
+                            text: root.service ? (root.service.gpuDetected ? "Detected" : "Detecting…")
+                                : (root.serviceState ? (root.serviceState.gpuDetected ? "Detected" : "Detecting…") : "Detecting…")
                             color: root.muted
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.caption
@@ -1152,7 +1287,7 @@ Panel {
                     }
 
                     Text {
-                        visible: root.service && root.service.gpuDetected && (root.gpu.codecs || []).indexOf("h264_software") === -1
+                        visible: Boolean(root.service ? root.service.gpuDetected : (root.serviceState ? root.serviceState.gpuDetected : false)) && (root.gpu.codecs || []).indexOf("h264_software") === -1
                         text: "Hardware encoding active. CPU fallback is enabled automatically if the GPU encoder is unavailable."
                         color: root.muted
                         font.family: root.fontFamily
@@ -1161,6 +1296,52 @@ Panel {
                         width: parent.width
                     }
                 }
+            }
+        }
+    }
+
+    // Fallback IPC action process — used when service object is null
+    // (replacement bars can't resolve third-party services)
+    Process {
+        id: ipcActionProc
+        running: false
+    }
+
+    Process {
+        id: toggleIpcAction
+        running: false
+    }
+
+    Process {
+        id: configIpcProc
+        running: false
+    }
+
+    // Fallback region picker — used when service object is null
+    Process {
+        id: fallbackRegionPicker
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var out = text.trim();
+                if (!out || out === "cancelled" || out === "null") {
+                    root._localError = "Region selection was cancelled";
+                    return;
+                }
+                if (out.match(/^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/)) {
+                    root.setConfig("_lastRegion", out);
+                } else {
+                    var m = out.match(/^(-?[0-9]+),(-?[0-9]+)\s+([0-9]+)x([0-9]+)$/);
+                    if (m) {
+                        var geom = m[3] + "x" + m[4] + "+" + m[1] + "+" + m[2];
+                        root.setConfig("_lastRegion", geom);
+                    }
+                }
+            }
+        }
+        onExited: function (exitCode) {
+            if (exitCode !== 0) {
+                root._localError = "Region selection failed";
             }
         }
     }

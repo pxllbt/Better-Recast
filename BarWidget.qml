@@ -1,4 +1,6 @@
 import QtQuick
+import Quickshell
+import Quickshell.Io
 import qs.Ui
 import qs.Commons
 
@@ -11,10 +13,26 @@ BarWidget {
 
     moduleName: "pix.recast"
 
-    property var service: bar && bar.shell && typeof bar.shell.serviceFor === "function" ? bar.shell.serviceFor("pix.recast") : null
+    // State file written by Service.qml — needed because replacement bars
+    // (px.bar) cannot resolve third-party services via PluginBarFacade.
+    readonly property string stateFilePath: {
+        var xdg = Quickshell.env("XDG_RUNTIME_DIR");
+        if (!xdg || xdg.length === 0) xdg = "/tmp";
+        return xdg + "/px-gsr/state.json";
+    }
 
-    property string stateText: ""
-    property int elapsed: 0
+    property var service: null
+    property var serviceState: ({})
+
+    // Derived from either the live service object (built-in bar) or the
+    // state file (replacement bar). When service is null, serviceState
+    // drives display; when service is available, it takes precedence.
+    readonly property string stateText: root.service
+        ? (root.service.recordingState || "idle")
+        : (root.serviceState.recordingState || root.serviceState.state || "idle")
+    readonly property int elapsed: root.service
+        ? (root.service.recordingElapsed || 0)
+        : (root.serviceState.recordingElapsed || 0)
 
     // Popup is hosted by Panel.qml, which the bar mounts per monitor through
     // this hidden loader. The panel extends qs.Ui Panel, so the bar's popout
@@ -36,22 +54,54 @@ BarWidget {
             target.hostWidget = root;
         if ("service" in target)
             target.service = root.service;
+        if ("serviceState" in target)
+            target.serviceState = root.serviceState;
+    }
+
+    function _tryGetService() {
+        if (service) return service;
+        if (!bar || !bar.shell) return null;
+        if (typeof bar.shell.serviceFor === "function") {
+            var s = bar.shell.serviceFor("pix.recast");
+            if (s) { service = s; return s; }
+        }
+        if (typeof bar.shell.firstPartyServiceFor === "function") {
+            var f = bar.shell.firstPartyServiceFor("pix.recast");
+            if (f) { service = f; return f; }
+        }
+        return null;
+    }
+
+    function applyServiceState(raw) {
+        var parsed = {};
+        try {
+            parsed = JSON.parse(String(raw || "").trim() || "{}");
+        } catch (e) {
+            parsed = {};
+        }
+        root.serviceState = parsed;
+        _tryGetService();
+        // Push updated state to the Panel so its readonly properties
+        // (cfg, gpu, state, etc.) re-evaluate with fresh data.
+        if (panelLoader.item) {
+            if ("service" in panelLoader.item)
+                panelLoader.item.service = root.service;
+            if ("serviceState" in panelLoader.item)
+                panelLoader.item.serviceState = root.serviceState;
+        }
     }
 
     function refresh() {
-        if (!root.service)
-            return;
-        var s = root.service.recordingState || "idle";
-        var e = root.service.recordingElapsed || 0;
-        if (root.stateText !== s)
-            root.stateText = s;
-        if (root.elapsed !== e)
-            root.elapsed = e;
+        _tryGetService();
+        if (panelLoader.item && ("service" in panelLoader.item))
+            panelLoader.item.service = root.service;
     }
 
     readonly property bool recording: stateText === "recording" || stateText === "paused" || stateText === "starting"
     readonly property bool pausedState: stateText === "paused"
-    readonly property bool streaming: root.service && root.service.config && (root.service.config.mode || "record") === "stream"
+    readonly property bool streaming: Boolean(root.service
+        ? (root.service.config && (root.service.config.mode || "record") === "stream")
+        : (root.serviceState.config && (root.serviceState.config.mode || "record") === "stream"))
 
     function formatElapsed(sec) {
         var h = Math.floor(sec / 3600);
@@ -95,10 +145,15 @@ BarWidget {
     onBarChanged: {
         refresh();
         injectPanel();
+        if (!stateReadProc.running) stateReadProc.running = true;
     }
-    onServiceChanged: injectPanel()
-    onSettingsChanged: injectPanel()
-    Component.onCompleted: refresh()
+    onSettingsChanged: {
+        injectPanel();
+    }
+    Component.onCompleted: {
+        refresh();
+        pollTimer.start();
+    }
 
     Connections {
         target: root.service
@@ -119,7 +174,13 @@ BarWidget {
         running: root.recording
         repeat: true
         triggeredOnStart: true
-        onTriggered: root.refresh()
+        onTriggered: {
+            if (!root.service) {
+                if (!stateReadProc.running) stateReadProc.running = true;
+            } else {
+                root.refresh();
+            }
+        }
     }
 
     implicitWidth: row.implicitWidth + Style.space(10)
@@ -178,11 +239,15 @@ BarWidget {
         acceptedButtons: Qt.LeftButton | Qt.RightButton
 
         onClicked: function (mouse) {
-            if (mouse.button === Qt.RightButton)
+            if (mouse.button === Qt.RightButton) {
                 root.togglePanel();
-            else if (mouse.button === Qt.LeftButton) {
-                if (root.service && typeof root.service.toggle === "function")
+            } else if (mouse.button === Qt.LeftButton) {
+                if (root.service && typeof root.service.toggle === "function") {
                     root.service.toggle();
+                } else {
+                    toggleActionProc.command = ["omarchy-shell", "px-recast", "toggle"];
+                    toggleActionProc.running = true;
+                }
             }
         }
         onEntered: if (root.bar)
@@ -200,5 +265,41 @@ BarWidget {
             root.injectPanel();
             Qt.callLater(root.injectPanel);
         }
+    }
+
+    // State file reader — replacement bars can't resolve third-party services,
+    // so the Service.qml writes a JSON snapshot that this widget polls via
+    // a Process (cat). FileView.reload() can silently skip updates in some
+    // environments (inotify misses changes, mtime granularity, etc.), so we
+    // read via Process which always returns the latest content.
+    Process {
+        id: stateReadProc
+        running: false
+        command: ["cat", root.stateFilePath]
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                root.applyServiceState(text)
+            }
+        }
+    }
+
+    // Polling timer — reads state.json every 1s.
+    Timer {
+        id: pollTimer
+        interval: 1000
+        repeat: true
+        onTriggered: {
+            if (!stateReadProc.running) {
+                stateReadProc.running = true;
+            }
+        }
+    }
+
+    // IPC fallback for toggle when the service object is not reachable
+    // (px.shell issue #41: replacement bars can't resolve third-party services).
+    Process {
+        id: toggleActionProc
+        running: false
     }
 }

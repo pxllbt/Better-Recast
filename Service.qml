@@ -33,11 +33,24 @@ Item {
     // ── Config (defaults seeded, then shell.json overrides) ──
     property var config: Config.normalize({})
     property bool configLoaded: false
+
     // True while we are persisting our own write to shell.json so the FileView
-    // reload (onFileChanged) can skip re-reading a buffer that may still lag the
-    // disk write — otherwise the in-memory config we just updated gets reverted,
-    // which is why settings like mode sometimes need two toggles to stick.
-    property bool _configSelfWrite: false
+    // reload (onFileChanged / onLoaded) can skip re-reading a buffer that may
+    // still lag the disk write — otherwise the in-memory config we just updated
+    // gets reverted, which is why settings like mode sometimes need two toggles
+    // to stick.
+    property bool _configWriteInProgress: false
+
+    // Timer to delay clearing the write-in-progress flag. Multiple file system
+    // events can fire during a single write (onFileChanged + onLoaded); a small
+    // window avoids a reload sneaking in before the file is fully flushed.
+    Timer {
+        id: configWriteDelay
+        interval: 250
+        onTriggered: {
+            root._configWriteInProgress = false;
+        }
+    }
 
     // ── Recording state ──
     property string state: "idle" // idle | starting | recording | paused | stopping | error
@@ -103,6 +116,7 @@ Item {
         refreshGpuInfo();
         refreshMonitors();
         refreshConfig();
+        Qt.callLater(function() { flushState() });
     }
 
     // ── Public API (used by BarWidget / Panel) ──
@@ -180,7 +194,6 @@ Item {
         }
 
         // Try to start; if hardware is missing, surface a friendly error.
-        args = Config.encodeGsrArgs(config, gpuInfo, target);
         recordingFile = outputDir + "/screenrecording-" + Config.makeTimestamp() + "." + (config.container || "mp4");
         args = args.concat(["-o", recordingFile, "-ipc", ipcSocketPath]);
         args.unshift("gpu-screen-recorder");
@@ -206,18 +219,16 @@ Item {
     }
 
     function stop() {
-        if (!active) {
-            if (state === "starting" || state === "stopping")
-                return;
-        }
-        if (state === "starting")
-            state = "stopping";
+        if (!active && state !== "starting")
+            return;
         state = "stopping";
         stopTimeout.restart();
         if (gsr.running) {
-            // Try graceful stop over the IPC socket; fall back to SIGINT.
             ipcStop.command = ["python3", ipcScriptPath, ipcSocketPath, "stop"];
             ipcStop.running = true;
+        } else {
+            stopTimeout.stop();
+            onRecordingSaved();
         }
     }
 
@@ -276,9 +287,12 @@ Item {
                 continue;
             entries[k] = config[k];
         }
-        var wrote = shell.updateEntryInline("pix.recast", entries);
-        if (wrote)
-            root._configSelfWrite = true;
+        // Set the flag BEFORE writing so that file change / load events that
+        // fire during the write are suppressed. The timer clears it after a
+        // short grace period to catch any delayed events.
+        root._configWriteInProgress = true;
+        configWriteDelay.restart();
+        shell.updateEntryInline("pix.recast", entries);
     }
 
     function refreshConfig() {
@@ -415,11 +429,23 @@ Item {
         path: root.configFilePath
         blockAllReads: false
         watchChanges: true
-        onLoaded: root.refreshConfig()
-        onLoadFailed: root.refreshConfig()
+        onLoaded: {
+            if (root._configWriteInProgress) {
+                configWriteDelay.restart();
+                return;
+            }
+            root.refreshConfig();
+        }
+        onLoadFailed: {
+            if (root._configWriteInProgress) {
+                configWriteDelay.restart();
+                return;
+            }
+            root.refreshConfig();
+        }
         onFileChanged: {
-            if (root._configSelfWrite) {
-                root._configSelfWrite = false;
+            if (root._configWriteInProgress) {
+                configWriteDelay.restart();
                 return;
             }
             root.refreshConfig();
@@ -448,6 +474,11 @@ Item {
                 root.gpuDetected = true;
                 var effective = Config.applyGpuProfile(root.config, root.gpuInfo);
                 root.config = Config.normalize(effective);
+            }
+        }
+        onExited: function (exitCode, exitStatus) {
+            if (!root.gpuDetected) {
+                root.gpuDetected = true;
             }
         }
     }
@@ -570,13 +601,79 @@ Item {
         }
     }
 
+    // ── State file (replacement-bar fallback) ──
+    // px-shell issue #41: replacement bars (px.bar) cannot resolve
+    // third-party services through their PluginBarFacade — neither
+    // pluginShellForBarEntry() nor the scoped pluginShellFor() give a
+    // replacement bar a service-capable handle for a different plugin's
+    // id. The built-in omarchy.bar gets one via pluginShellForId(),
+    // but px.bar is restricted by design. Instead, Service.qml mirrors
+    // its relevant state into a JSON file that BarWidget.qml + Panel.qml
+    // can read directly (same pattern px.media → px.notch uses).
+    readonly property string barStatePath: runtimeDir + "/state.json"
+
+    function statusJson() {
+        var st = root.state;
+        var cfg = root.config || {};
+        return JSON.stringify({
+            state: st,
+            recordingState: st,
+            recordingIsStream: root.recordingIsStream,
+            recordingElapsed: root.recordingElapsed,
+            recordingFile: root.recordingFile,
+            gpuDetected: root.gpuDetected,
+            gpuInfo: root.gpuInfo,
+            monitors: root.monitors,
+            audioDevices: root.audioDevices,
+            config: cfg,
+            configLoaded: root.configLoaded,
+            active: root.active,
+            paused: root.paused,
+            busy: root.busy,
+            errorMessage: root.errorMessage,
+            outputDir: root.outputDir,
+            configFilePath: root.configFilePath,
+            stateFilePath: root.stateFilePath,
+            barStatePath: root.barStatePath,
+            recordingStateFilePath: root.recordingStateFilePath,
+            ipcSocketPath: root.ipcSocketPath,
+            ipcScriptPath: root.ipcScriptPath
+        });
+    }
+
+    function flushState() {
+        if (!root.gpuDetected && root.state === "idle") return;
+        // Write the state file via FileView.setText with atomicWrites: false
+        // so inotify watchers in BarWidget.qml can detect the change.
+        stateFile.setText(root.statusJson() + "\n");
+    }
+
+    FileView {
+        id: stateFile
+        path: root.barStatePath
+        watchChanges: false
+        atomicWrites: false
+        printErrors: false
+    }
+
     // State transition bookkeeping
     onStateChanged: {
         if (state === "recording") {
             recordingBaseSec = recordingElapsed;
             recordingBaseMs = Date.now();
         }
+        flushState();
     }
+
+    onRecordingElapsedChanged: { flushState() }
+    onGpuDetectedChanged: { flushState() }
+    onGpuInfoChanged: { flushState() }
+    onMonitorsChanged: { flushState() }
+    onConfigChanged: { flushState() }
+    onConfigLoadedChanged: { flushState() }
+    onRecordingIsStreamChanged: { flushState() }
+    onRecordingFileChanged: { flushState() }
+    onErrorMessageChanged: { flushState() }
 
     // Elapsed timer (only while recording)
     Timer {
@@ -589,6 +686,58 @@ Item {
             if (root.state === "recording") {
                 root.recordingElapsed = root.recordingBaseSec + Math.floor((Date.now() - root.recordingBaseMs) / 1000);
             }
+        }
+    }
+
+    // IPC target so bar widgets / keybinds can toggle recording even when
+    // the service object is not reachable through the host's PluginShellApi
+    // (px-shell issue #41: replacement bars can't resolve third-party services).
+    IpcHandler {
+        target: "px-recast"
+
+        function toggle(): string {
+            root.toggle();
+            return "ok";
+        }
+
+        function pause(): string {
+            root.pause();
+            return "ok";
+        }
+
+        function resume(): string {
+            root.resume();
+            return "ok";
+        }
+
+        function status(): string {
+            return root.statusJson();
+        }
+
+        function record(): string {
+            root.start("auto");
+            return "ok";
+        }
+
+        function stop(): string {
+            root.stop();
+            return "ok";
+        }
+
+        function refreshGpu(): string {
+            root.refreshGpuInfo();
+            root.refreshMonitors();
+            return "ok";
+        }
+
+        function config(key: string, value: string): string {
+            root.setConfig(key, value);
+            return "ok";
+        }
+
+        function persist(): string {
+            root.persistConfig();
+            return "ok";
         }
     }
 }
