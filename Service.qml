@@ -228,7 +228,8 @@ Item {
             ipcStop.running = true;
         } else {
             stopTimeout.stop();
-            onRecordingSaved();
+            // gsr already exited — verify the file before declaring saved
+            fileVerifyTimer.restart();
         }
     }
 
@@ -517,7 +518,11 @@ Item {
         onExited: function (exitCode, exitStatus) {
             stopTimeout.stop();
             if (root.state === "stopping") {
-                root.onRecordingSaved();
+                // Don't call onRecordingSaved() immediately — gsr may
+                // exit before the OS flushes write buffers to disk.
+                // Wait a moment and verify the file exists and is
+                // non-zero in size first.
+                fileVerifyTimer.restart();
             } else if (root.state === "starting" || root.state === "recording" || root.state === "paused") {
                 root.onRecordingFailed("gpu-screen-recorder exited unexpectedly (code " + exitCode + ")");
             } else {
@@ -595,8 +600,48 @@ Item {
         interval: 6000
         onTriggered: {
             if (gsr.running) {
-                fallbackStop.command = ["bash", "-c", "pkill -INT -x gpu-screen-reco || true"];
+                fallbackStop.command = ["bash", "-c", "pkill -INT -x gpu-screen-recorder || true"];
                 fallbackStop.running = true;
+            }
+        }
+    }
+
+    // Timer to verify the recording file is fully written before
+    // declaring it saved. gsr may exit before the OS flushes all write
+    // buffers, so we wait briefly and check the file exists with
+    // non-zero size. Prevents the "laggy playback / truncated file"
+    // issue caused by reading a file that's still being flushed.
+    Timer {
+        id: fileVerifyTimer
+        interval: 500
+        onTriggered: {
+            var f = root.recordingFile;
+            if (f && f.length > 0) {
+                var checkCmd = ["bash", "-c", "test -s '" + f + "' && echo ok || echo missing"];
+                fileVerifyProc.command = checkCmd;
+                fileVerifyProc.running = true;
+            } else {
+                // No file path means it was a stream or the path was already cleared
+                root.onRecordingSaved();
+            }
+        }
+    }
+
+    Process {
+        id: fileVerifyProc
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                if (text.trim() === "ok") {
+                    root.onRecordingSaved();
+                } else {
+                    root.onRecordingFailed("Recording file missing or empty — write may have been interrupted");
+                }
+            }
+        }
+        onExited: function (exitCode) {
+            if (exitCode !== 0) {
+                root.onRecordingFailed("Recording file verification failed");
             }
         }
     }

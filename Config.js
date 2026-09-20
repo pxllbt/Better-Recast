@@ -17,10 +17,10 @@ function defaultConfig() {
     quality: "auto",          // "auto" | "medium" | "high" | "very_high" | "ultra" | number (kbps for cbr)
     fps: 60,
     resolution: "",           // "" = native, "1920x1080", etc.
-    frameMode: "cfr",         // "cfr" | "vfr" | "content"
+    frameMode: "vfr",         // "cfr" | "vfr" | "content"
     colorRange: "limited",    // "limited" | "full"
     tune: "performance",      // "performance" | "quality"
-    keyInterval: 2.0,
+    keyInterval: 1.0,
     cursor: true,
 
     // Audio
