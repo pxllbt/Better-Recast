@@ -335,13 +335,6 @@ Panel {
                 root.service.setConfig(key, value);
             else if (typeof root.service.setSessionConfig === "function")
                 root.service.setSessionConfig(key, value);
-            else if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function") {
-                var entry = { id: "pix.recast" };
-                for (var k in root.settings)
-                    if (k !== "id") entry[k] = root.settings[k];
-                entry[key] = value;
-                root.bar.shell.updateEntryInline("pix.recast", entry);
-            }
             else
                 root.service.setConfig(key, value);
         } else if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function") {

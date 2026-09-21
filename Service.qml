@@ -223,6 +223,8 @@ Item {
         }
         ipcSaveReplay.command = cmd;
         ipcSaveReplay.running = true;
+        recordingBaseSec = 0;
+        recordingBaseMs = Date.now();
     }
 
     function stopReplay() {
@@ -686,7 +688,7 @@ Item {
                 // Wait a moment and verify the file exists and is
                 // non-zero in size first.
                 fileVerifyTimer.restart();
-            } else if (root.state === "starting" || root.state === "recording" || root.state === "paused") {
+            } else if (root.state === "starting" || root.state === "recording" || root.state === "paused" || root.state === "replay") {
                 root.onRecordingFailed("gpu-screen-recorder exited unexpectedly (code " + exitCode + ")");
             } else {
                 root.state = "idle";

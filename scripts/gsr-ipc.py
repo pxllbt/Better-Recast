@@ -29,21 +29,14 @@ def main():
     request_id = 1
 
     if command == "status":
-        request = {"id": request_id, "name": "set-paused", "data": False}
         # status is not a real gsr command — just check if socket is reachable
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(2.0)
             s.connect(socket_path)
-            s.sendall(json.dumps({"id": request_id, "name": "toggle-pause"}).encode() + b"\n")
-            data = s.recv(4096)
             s.close()
-            reply = json.loads(data.decode().strip())
-            if reply.get("result") == "ok":
-                print("running")
-            else:
-                print("not running")
-        except (socket.error, OSError, json.JSONDecodeError, ValueError):
+            print("running")
+        except (socket.error, OSError):
             print("not running")
         return
 
