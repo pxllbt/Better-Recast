@@ -76,6 +76,12 @@ Item {
     property string _lastSavedPath: ""
     readonly property string lastSavedPath: _lastSavedPath
 
+    // Saved volumes so we can restore the user's listening level
+    // when recording stops. applyVolume() saves via volReadProc before
+    // overriding; restoreVolume() restores them on stop/fail.
+    property var _savedAudioSinkVolume: 1.0
+    property var _savedAudioSourceVolume: 0.0
+
     readonly property bool active: state === "recording" || state === "paused"
     readonly property bool paused: state === "paused"
     readonly property bool replayActive: state === "replay"
@@ -402,6 +408,11 @@ Item {
             setWpctlVolume("DEFAULT_AUDIO_SOURCE", 0);
             return;
         }
+        // Snapshot current volume before overriding it
+        _savedAudioSinkVolume = 1.0;
+        _savedAudioSourceVolume = 0.0;
+        volReadProc.command = ["bash", "-c", "wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null | awk '{print $2}'"];
+        volReadProc.running = true;
         if (config.audioDesktop)
             setWpctlVolume("DEFAULT_AUDIO_SINK", config.audioVolume || 100);
         else
@@ -416,6 +427,11 @@ Item {
         if (!wpctlProc) return;
         wpctlProc.command = ["bash", "-c", "wpctl set-volume @" + node + "@ " + (volumePercent / 100).toFixed(2)];
         wpctlProc.running = true;
+    }
+
+    function restoreVolume() {
+        setWpctlVolume("DEFAULT_AUDIO_SINK", _savedAudioSinkVolume * 100);
+        setWpctlVolume("DEFAULT_AUDIO_SOURCE", _savedAudioSourceVolume * 100);
     }
 
     function setSessionConfig(key, value) {
@@ -553,6 +569,7 @@ Item {
             root._lastSavedPath = saved;
             sendNotification("Screen recording saved", saved, "normal", 10000);
         }
+        restoreVolume();
     }
 
     function onRecordingFailed(msg) {
@@ -565,6 +582,7 @@ Item {
         clearMarkerProc.command = ["bash", "-c", "rm -f " + recordingStateFilePath + " " + stateFilePath];
         clearMarkerProc.running = true;
         sendNotification(wasStream ? "Stream ended unexpectedly" : "Screen recording failed", msg, "critical", 8000);
+        restoreVolume();
     }
 
     function sendNotification(summary, body, urgency, timeout) {
@@ -692,6 +710,7 @@ Item {
                 root.onRecordingFailed("gpu-screen-recorder exited unexpectedly (code " + exitCode + ")");
             } else {
                 root.state = "idle";
+                restoreVolume();
             }
         }
     }
@@ -778,6 +797,20 @@ Item {
 
     Process {
         id: wpctlProc
+    }
+
+    // Reads current desktop volume before applyVolume() overrides it,
+    // so restoreVolume() can put it back when recording stops.
+    Process {
+        id: volReadProc
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var out = String(text || "").trim()
+                var m = out.match(/([0-9.]+)/)
+                if (m) root._savedAudioSinkVolume = parseFloat(m[1])
+            }
+        }
     }
 
     // Fallback when the IPC stop didn't terminate the recorder: SIGINT is
