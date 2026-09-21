@@ -719,7 +719,6 @@ Item {
     }
     Process {
         id: openProc
-        suppressProcessOutput: true
     }
 
     Process {
