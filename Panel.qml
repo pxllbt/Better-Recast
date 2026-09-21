@@ -50,6 +50,15 @@ Panel {
     // Error message: pulled from the live service, the state file, or set
     // locally for fallback-path errors (e.g. region picker cancelled).
     property string _localError: ""
+    // Rolling in-panel error log (most recent last, capped at 6).
+    property var _errorLog: []
+    function _pushError(msg) {
+        if (!msg)
+            return;
+        var next = root._errorLog.slice(-5);
+        next.push(msg);
+        root._errorLog = next;
+    }
     readonly property string errorMessage: root.service
         ? (root.service.errorMessage || "")
         : (root.serviceState
@@ -118,6 +127,10 @@ Panel {
         : (root.serviceState && root.serviceState.gpuInfo
             ? root.serviceState.gpuInfo
             : { vendor: "unknown", codecs: [] })
+    // Audio devices for the desktop/mic selectors (live service → state file)
+    readonly property var audioDevices: root.service
+        ? (root.service.audioDevices || [])
+        : (root.serviceState ? (root.serviceState.audioDevices || []) : [])
     readonly property string state: root.service
         ? (root.service.recordingState || root.service.state || "idle")
         : (root.serviceState && (root.serviceState.recordingState || root.serviceState.state) || "idle")
@@ -127,6 +140,18 @@ Panel {
     readonly property bool isStream: root.service && root.service.config
         ? root.service.config.mode === "stream"
         : (root.cfg && root.cfg.mode === "stream")
+    readonly property bool isReplay: root.service && root.service.config
+        ? root.service.config.mode === "replay"
+        : (root.cfg && root.cfg.mode === "replay")
+    readonly property bool replayActive: root.service
+        ? (root.service.replayActive === true)
+        : (root.serviceState ? (root.serviceState.replayActive === true) : false)
+    readonly property int elapsed: root.service
+        ? (root.service.recordingElapsed || 0)
+        : (root.serviceState ? (root.serviceState.recordingElapsed || 0) : 0)
+    readonly property string lastSavedPath: root.service
+        ? (root.service.lastSavedPath || "")
+        : (root.serviceState ? (root.serviceState.lastSavedPath || "") : "")
 
     function formatElapsed(sec) {
         var h = Math.floor(sec / 3600);
@@ -136,6 +161,31 @@ Panel {
             return n < 10 ? "0" + n : String(n);
         };
         return (h > 0 ? pad(h) + ":" : "") + pad(m) + ":" + pad(s);
+    }
+
+    function settingsSummary() {
+        var c = root.cfg;
+        var parts = [];
+        if (c.codec && c.codec !== "auto")
+            parts.push((c.codec || "").toUpperCase());
+        if (c.quality && c.quality !== "auto")
+            parts.push(c.quality);
+        if (c.frameMode && c.frameMode !== "auto" && c.frameMode !== "cfr")
+            parts.push(c.frameMode);
+        if (c.container)
+            parts.push(c.container);
+        if (c.fps)
+            parts.push(c.fps + " fps");
+        if (c.encoder === "cpu")
+            parts.push("CPU encoder");
+        if (c.audioEnabled === false)
+            parts.push("no audio");
+        else {
+            parts.push("audio");
+            if (c.audioMicrophone)
+                parts.push("mic");
+        }
+        return parts.length ? parts.join("  \u00b7  ") : "";
     }
 
     function stateLabel() {
@@ -223,6 +273,27 @@ Panel {
             });
         }
         return list;
+    }
+
+    function audioDeviceOptions() {
+        var list = [];
+        for (var i = 0; i < root.audioDevices.length; i++) {
+            var d = root.audioDevices[i];
+            list.push({
+                value: d.id,
+                label: d.name || d.id
+            });
+        }
+        return list;
+    }
+
+    // Numeric config read that never coerces 0 to the fallback.
+    function cfgNum(key, fallback) {
+        var v = root.cfg ? root.cfg[key] : undefined;
+        var n = Number(v);
+        if (v === undefined || v === null || isNaN(n))
+            return fallback;
+        return n;
     }
 
     function setConfig(key, value) {
@@ -345,6 +416,17 @@ Panel {
         }
     }
 
+    function saveReplay() {
+        if (!root.replayActive)
+            return;
+        if (root.service && typeof root.service.saveReplay === "function") {
+            root.service.saveReplay();
+        } else {
+            ipcActionProc.command = ["omarchy-shell", "px-recast", "saveReplay"];
+            ipcActionProc.running = true;
+        }
+    }
+
     // Popup is driven by the qs.Ui Panel base: open()/close()/toggle()/opened
     // come from the PanelController, closeForPopoutSwitch() keeps the card
     // visible while the bar hands the popout over to another panel, and
@@ -368,14 +450,28 @@ Panel {
         focusTarget: keyCatcher
         open: root.opened
         centerOnBar: false
-        contentWidth: panel.fittedContentWidth(Style.space(400))
+        contentWidth: panel.fittedContentWidth(Style.space(460))
         contentHeight: panel.fittedContentHeight(Style.space(440))
 
         PanelKeyCatcher {
             id: keyCatcher
             anchors.fill: parent
+            // While a spinbox is being edited, forward keys to the field so the
+            // S shortcut can't fire mid-typing.
+            blocked: streamKbpsField.field.activeFocus
+                || fpsField.field.activeFocus
+                || audioBitrateField.field.activeFocus
+                || keyframeField.field.activeFocus
+                || replaySecondsField.field.activeFocus
+                || replayBitrateField.field.activeFocus
+                || replaySaveLengthField.field.activeFocus
+                || outputDirField.activeFocus
             onCloseRequested: root.requestClose()
             onActivateRequested: root.toggleRecording()
+            onTextKey: function(t) {
+                if ((t === "s" || t === "S") && root.replayActive)
+                    root.saveReplay();
+            }
 
             ScrollView {
                 anchors.fill: parent
@@ -429,13 +525,13 @@ Panel {
                         Button {
                             text: "Record"
                             Layout.fillWidth: true
-                            selected: !root.isStream
+                            selected: !root.isStream && !root.isReplay
                             foreground: root.foreground
                             accent: root.accent
                             fontFamily: root.fontFamily
                             fontSize: Style.font.body
                             onClicked: {
-                                if (root.isStream)
+                                if (root.isStream || root.isReplay)
                                     root.setConfig("mode", "record");
                             }
                         }
@@ -453,6 +549,20 @@ Panel {
                                     root.setConfig("mode", "stream");
                             }
                         }
+
+                        Button {
+                            text: "Replay"
+                            Layout.fillWidth: true
+                            selected: root.isReplay
+                            foreground: root.foreground
+                            accent: root.accent
+                            fontFamily: root.fontFamily
+                            fontSize: Style.font.body
+                            onClicked: {
+                                if (!root.isReplay)
+                                    root.setConfig("mode", "replay");
+                            }
+                        }
                     }
 
                     // ---- Primary action button ------------------------------------------
@@ -466,11 +576,54 @@ Panel {
                         text: {
                             if (root.busy)
                                 return root.state === "starting" ? "Starting…" : "Stopping…";
+                            if (root.replayActive)
+                                return "▶  Save replay";
                             if (root.recording)
                                 return root.paused ? "▶  Resume" : (root.isStream ? "■  Stop stream" : "■  Stop");
+                            if (root.isReplay)
+                                return "●  Start buffer";
                             return root.isStream ? "●  Go live" : "●  Record";
                         }
-                        onClicked: root.toggleRecording()
+                        onClicked: {
+                            if (root.replayActive)
+                                root.saveReplay();
+                            else
+                                root.toggleRecording();
+                        }
+                    }
+
+                    // Replay buffer control row: save (S) + stop buffer.
+                    RowLayout {
+                        width: parent.width
+                        spacing: Style.space(8)
+                        visible: root.replayActive
+
+                        Button {
+                            text: "Save replay"
+                            foreground: root.foreground
+                            accent: root.accent
+                            fontFamily: root.fontFamily
+                            onClicked: root.saveReplay()
+                        }
+
+                        Button {
+                            text: "Stop buffer"
+                            foreground: root.foreground
+                            accent: root.urgent
+                            fontFamily: root.fontFamily
+                            onClicked: root.toggleRecording()
+                        }
+
+                        Text {
+                            text: "Last " + String(root.cfg.replaySeconds || 60) + "s · " + root.formatElapsed(root.elapsed)
+                                + " · " + String(Math.min(100, Math.round(root.elapsed / (root.cfg.replaySeconds || 60) * 100))) + "%"
+                            color: root.muted
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                            Layout.fillWidth: true
+                            elide: Text.ElideRight
+                            maximumLineCount: 1
+                        }
                     }
 
                     Row {
@@ -522,8 +675,8 @@ Panel {
                     }
 
                     Text {
-                visible: root.state === "error" && root.errorMessage.length > 0
-                text: "Error: " + root.errorMessage
+                        visible: root.state === "error" && root.errorMessage.length > 0
+                        text: "Error: " + root.errorMessage
                         color: root.urgent
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
@@ -830,6 +983,7 @@ Panel {
                                 Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
                             }
                             NumberField {
+                                id: streamKbpsField
                                 value: Number(root.cfg.streamKbps || 6000)
                                 from: 32
                                 to: 20000
@@ -907,6 +1061,147 @@ Panel {
                         }
                     }
 
+                    // ---- Instant replay (mode == replay) ----------------------------------
+                    Column {
+                        width: parent.width
+                        spacing: Style.space(8)
+                        visible: root.isReplay
+
+                        PanelSectionHeader {
+                            text: "REPLAY"
+                            foreground: root.foreground
+                            fontFamily: root.fontFamily
+                        }
+
+                        GridLayout {
+                            width: parent.width
+                            columns: 2
+                            columnSpacing: Style.space(10)
+                            rowSpacing: Style.space(8)
+
+                            Text {
+                                text: "Buffer length"
+                                color: root.muted
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                                Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                            }
+                            NumberField {
+                                id: replaySecondsField
+                                value: Number(root.cfg.replaySeconds || 60)
+                                from: 5
+                                to: 600
+                                stepSize: 5
+                                foreground: root.foreground
+                                accent: root.accent
+                                fontFamily: root.fontFamily
+                                fontSize: Style.font.caption
+                                onModified: function (v) {
+                                    root.setConfig("replaySeconds", v);
+                                }
+                            }
+
+                            Text {
+                                text: "Buffer storage"
+                                color: root.muted
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                                Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                            }
+                            Dropdown {
+                                label: ""
+                                value: root.cfg.replayStorage || "ram"
+                                options: [
+                                    {
+                                        value: "ram",
+                                        label: "RAM (faster)"
+                                    },
+                                    {
+                                        value: "disk",
+                                        label: "Disk"
+                                    }
+                                ]
+                                foreground: root.foreground
+                                background: root.background
+                                accent: root.accent
+                                fontFamily: root.fontFamily
+                                Layout.fillWidth: true
+                                onChanged: function (v) {
+                                    root.setConfig("replayStorage", v);
+                                }
+                            }
+
+                            Text {
+                                text: "Bitrate (kbps)"
+                                color: root.muted
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                                Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                            }
+                            NumberField {
+                                id: replayBitrateField
+                                value: Number(root.cfg.replayKbps || 20000)
+                                from: 1000
+                                to: 100000
+                                stepSize: 500
+                                foreground: root.foreground
+                                accent: root.accent
+                                fontFamily: root.fontFamily
+                                fontSize: Style.font.caption
+                                onModified: function (v) {
+                                    root.setConfig("replayKbps", v);
+                                }
+                            }
+
+                            Text {
+                                text: "Save length"
+                                color: root.muted
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                                Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                            }
+                            NumberField {
+                                id: replaySaveLengthField
+                                value: Number(root.cfg.replaySaveSeconds || 0)
+                                from: 0
+                                to: 600
+                                stepSize: 5
+                                foreground: root.foreground
+                                accent: root.accent
+                                fontFamily: root.fontFamily
+                                fontSize: Style.font.caption
+                                onModified: function (v) {
+                                    root.setConfig("replaySaveSeconds", v);
+                                }
+                            }
+
+                            Text {
+                                text: "Date folders"
+                                color: root.muted
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                                Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                            }
+                            ToggleSwitch {
+                                checked: root.cfg.replayOrganize === true
+                                foreground: root.foreground
+                                accent: root.accent
+                                Layout.fillWidth: true
+                                Layout.alignment: Qt.AlignLeft | Qt.AlignVCenter
+                                onToggled: root.setConfig("replayOrganize", !root.cfg.replayOrganize)
+                            }
+                        }
+
+                        Text {
+                            text: "Save keeps the clip (0 = whole buffer), then the buffer restarts. CBR keeps buffer RAM predictable."
+                            color: root.muted
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.bodySmall
+                            wrapMode: Text.WordWrap
+                            width: parent.width
+                        }
+                    }
+
                     // ---- Settings --------------------------------------------------------
                     Column {
                         width: parent.width
@@ -933,6 +1228,7 @@ Panel {
                                 Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
                             }
                             NumberField {
+                                id: fpsField
                                 value: Number(root.cfg.fps || 60)
                                 from: 1
                                 to: 240
@@ -1040,6 +1336,198 @@ Panel {
                             }
                         }
 
+                        // ---- Audio devices + volume --------------------------------------
+                        Column {
+                            width: parent.width
+                            spacing: Style.space(6)
+                            visible: root.cfg.audioEnabled !== false
+
+                            Text {
+                                text: "Audio devices"
+                                color: root.muted
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                            }
+
+                            GridLayout {
+                                width: parent.width
+                                columns: 2
+                                columnSpacing: Style.space(10)
+                                rowSpacing: Style.space(8)
+
+                                Text {
+                                    text: "Desktop"
+                                    color: root.muted
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                                }
+                                Dropdown {
+                                    label: ""
+                                    value: root.cfg.audioDesktopDevice || "default_output"
+                                    options: root.audioDeviceOptions()
+                                    foreground: root.foreground
+                                    background: root.background
+                                    accent: root.accent
+                                    fontFamily: root.fontFamily
+                                    Layout.fillWidth: true
+                                    onChanged: function (v) {
+                                        root.setConfig("audioDesktopDevice", v);
+                                    }
+                                }
+
+                                Text {
+                                    text: "Mic"
+                                    color: root.muted
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                                }
+                                Dropdown {
+                                    label: ""
+                                    value: root.cfg.audioMicDevice || "default_input"
+                                    options: root.audioDeviceOptions()
+                                    foreground: root.foreground
+                                    background: root.background
+                                    accent: root.accent
+                                    fontFamily: root.fontFamily
+                                    Layout.fillWidth: true
+                                    onChanged: function (v) {
+                                        root.setConfig("audioMicDevice", v);
+                                    }
+                                }
+
+                                Text {
+                                    text: "Desktop volume"
+                                    color: root.muted
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                                }
+                                RowLayout {
+                                    spacing: Style.space(6)
+                                    Layout.fillWidth: true
+
+                                    PanelSlider {
+                                        id: desktopVolumeSlider
+                                        Layout.fillWidth: true
+                                        minimum: 0
+                                        maximum: 100
+                                        integer: true
+                                        step: 5
+                                        tickCount: 5
+                                        value: root.cfgNum("audioVolume", 100)
+                                        onReleased: function (v) {
+                                            root.setConfig("audioVolume", v);
+                                        }
+                                    }
+
+                                    Text {
+                                        text: desktopVolumeSlider.liveValue.toFixed(0) + "%"
+                                        color: root.muted
+                                        font.family: root.fontFamily
+                                        font.pixelSize: Style.font.caption
+                                        Layout.alignment: Qt.AlignVCenter
+                                    }
+                                }
+
+                                Text {
+                                    text: "Mic volume"
+                                    color: root.muted
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                                }
+                                RowLayout {
+                                    spacing: Style.space(6)
+                                    Layout.fillWidth: true
+
+                                    PanelSlider {
+                                        id: micVolumeSlider
+                                        Layout.fillWidth: true
+                                        minimum: 0
+                                        maximum: 100
+                                        integer: true
+                                        step: 5
+                                        tickCount: 5
+                                        value: root.cfgNum("audioMicVolume", 100)
+                                        onReleased: function (v) {
+                                            root.setConfig("audioMicVolume", v);
+                                        }
+                                    }
+
+                                    Text {
+                                        text: micVolumeSlider.liveValue.toFixed(0) + "%"
+                                        color: root.muted
+                                        font.family: root.fontFamily
+                                        font.pixelSize: Style.font.caption
+                                        Layout.alignment: Qt.AlignVCenter
+                                    }
+                                }
+
+                                Text {
+                                    text: "Codec"
+                                    color: root.muted
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                                }
+                                Dropdown {
+                                    label: ""
+                                    value: root.cfg.audioCodec || "aac"
+                                    options: [
+                                        {
+                                            value: "aac",
+                                            label: "AAC"
+                                        },
+                                        {
+                                            value: "opus",
+                                            label: "Opus"
+                                        }
+                                    ]
+                                    foreground: root.foreground
+                                    background: root.background
+                                    accent: root.accent
+                                    fontFamily: root.fontFamily
+                                    Layout.fillWidth: true
+                                    onChanged: function (v) {
+                                        root.setConfig("audioCodec", v);
+                                    }
+                                }
+
+                                Text {
+                                    text: "Bitrate"
+                                    color: root.muted
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                                }
+                                NumberField {
+                                    id: audioBitrateField
+                                    value: Number(root.cfg.audioBitrate || 0)
+                                    from: 0
+                                    to: 512
+                                    stepSize: 16
+                                    foreground: root.foreground
+                                    accent: root.accent
+                                    fontFamily: root.fontFamily
+                                    fontSize: Style.font.caption
+                                    onModified: function (v) {
+                                        root.setConfig("audioBitrate", v);
+                                    }
+                                }
+                            }
+
+                            Text {
+                                text: "0 = automatic bitrate"
+                                color: root.muted
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.bodySmall
+                                wrapMode: Text.WordWrap
+                                width: parent.width
+                            }
+                        }
+
                         Column {
                             width: parent.width
                             spacing: Style.space(6)
@@ -1051,15 +1539,93 @@ Panel {
                                 font.pixelSize: Style.font.caption
                             }
 
-                            TextField {
-                                text: root.cfg.outputDir || ""
-                                foreground: root.foreground
-                                accent: root.accent
+                            RowLayout {
+                                width: parent.width
+                                spacing: Style.space(6)
+
+                                TextField {
+                                    id: outputDirField
+                                    Layout.fillWidth: true
+                                    text: root.cfg.outputDir || ""
+                                    foreground: root.foreground
+                                    accent: root.accent
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    placeholderText: root.service ? root.service.outputDir
+                                        : (root.serviceState ? (root.serviceState.outputDir || "") : "")
+                                    onEditingFinished: root.setConfig("outputDir", text)
+                                }
+
+                                Button {
+                                    text: "Browse…"
+                                    foreground: root.foreground
+                                    accent: root.accent
+                                    fontFamily: root.fontFamily
+                                    fontSize: Style.font.caption
+                                    onClicked: {
+                                        browseDirProc.command = [
+                                            "bash", "-c",
+                                            "zenity --file-selection --directory --title='Select output folder' 2>/dev/null"
+                                        ];
+                                        browseDirProc.running = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---- Last saved clip ------------------------------------------------
+                        RowLayout {
+                            width: parent.width
+                            spacing: Style.space(6)
+                            visible: root.lastSavedPath !== ""
+
+                            Text {
+                                text: "Last clip"
+                                color: root.muted
                                 font.family: root.fontFamily
                                 font.pixelSize: Style.font.caption
-                                placeholderText: root.service ? root.service.outputDir
-                                    : (root.serviceState ? (root.serviceState.outputDir || "") : "")
-                                onEditingFinished: root.setConfig("outputDir", text)
+                            }
+
+                            Text {
+                                text: root.lastSavedPath
+                                color: root.foreground
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                                elide: Text.ElideMiddle
+                                maximumLineCount: 1
+                                Layout.fillWidth: true
+                            }
+
+                            Button {
+                                text: "Open"
+                                foreground: root.foreground
+                                accent: root.accent
+                                fontFamily: root.fontFamily
+                                fontSize: Style.font.caption
+                                onClicked: {
+                                    if (root.service)
+                                        root.service.openPath(root.lastSavedPath);
+                                    else {
+                                        ipcActionProc.command = ["omarchy-shell", "px-recast", "openClip"];
+                                        ipcActionProc.running = true;
+                                    }
+                                }
+                            }
+
+                            Button {
+                                text: "Folder"
+                                foreground: root.foreground
+                                accent: root.accent
+                                fontFamily: root.fontFamily
+                                fontSize: Style.font.caption
+                                onClicked: {
+                                    if (root.service)
+                                        root.service.openFolderOf(root.lastSavedPath);
+                                    else {
+                                        ipcActionProc.command = ["omarchy-shell", "px-recast", "openFolder"];
+                                        ipcActionProc.running = true;
+                                    }
+                                }
                             }
                         }
 
@@ -1250,6 +1816,174 @@ Panel {
                                         root.setConfig("encoder", v);
                                     }
                                 }
+
+                                Text {
+                                    text: "Frame mode"
+                                    color: root.muted
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                                    visible: !root.isStream
+                                }
+                                Dropdown {
+                                    label: ""
+                                    visible: !root.isStream
+                                    value: root.cfg.frameMode || "cfr"
+                                    options: [
+                                        {
+                                            value: "cfr",
+                                            label: "CFR (constant rate)"
+                                        },
+                                        {
+                                            value: "vfr",
+                                            label: "VFR (variable rate)"
+                                        },
+                                        {
+                                            value: "content",
+                                            label: "Content-aware"
+                                        }
+                                    ]
+                                    foreground: root.foreground
+                                    background: root.background
+                                    accent: root.accent
+                                    fontFamily: root.fontFamily
+                                    Layout.fillWidth: true
+                                    onChanged: function (v) {
+                                        root.setConfig("frameMode", v);
+                                    }
+                                }
+
+                                Text {
+                                    text: "Color range"
+                                    color: root.muted
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                                    visible: !root.isStream
+                                }
+                                Dropdown {
+                                    label: ""
+                                    visible: !root.isStream
+                                    value: root.cfg.colorRange || "limited"
+                                    options: [
+                                        {
+                                            value: "limited",
+                                            label: "Limited (TV)"
+                                        },
+                                        {
+                                            value: "full",
+                                            label: "Full (PC)"
+                                        }
+                                    ]
+                                    foreground: root.foreground
+                                    background: root.background
+                                    accent: root.accent
+                                    fontFamily: root.fontFamily
+                                    Layout.fillWidth: true
+                                    onChanged: function (v) {
+                                        root.setConfig("colorRange", v);
+                                    }
+                                }
+
+                                Text {
+                                    text: "Video tune"
+                                    color: root.muted
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                                    visible: !root.isStream
+                                }
+                                Dropdown {
+                                    label: ""
+                                    visible: !root.isStream
+                                    value: root.cfg.tune || "performance"
+                                    options: [
+                                        {
+                                            value: "performance",
+                                            label: "Performance"
+                                        },
+                                        {
+                                            value: "quality",
+                                            label: "Quality"
+                                        }
+                                    ]
+                                    foreground: root.foreground
+                                    background: root.background
+                                    accent: root.accent
+                                    fontFamily: root.fontFamily
+                                    Layout.fillWidth: true
+                                    onChanged: function (v) {
+                                        root.setConfig("tune", v);
+                                    }
+                                }
+
+                                Text {
+                                    text: "Keyframe interval"
+                                    color: root.muted
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                                    visible: !root.isStream
+                                }
+                                NumberField {
+                                    id: keyframeField
+                                    value: Number(root.cfg.keyInterval || 2.0)
+                                    from: 1
+                                    to: 10
+                                    stepSize: 1
+                                    visible: !root.isStream
+                                    foreground: root.foreground
+                                    accent: root.accent
+                                    fontFamily: root.fontFamily
+                                    fontSize: Style.font.caption
+                                    onModified: function (v) {
+                                        root.setConfig("keyInterval", v);
+                                    }
+                                }
+
+                                Text {
+                                    text: "Show timer"
+                                    color: root.muted
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                                }
+                                ToggleSwitch {
+                                    checked: root.cfg.showTimer !== false
+                                    foreground: root.foreground
+                                    accent: root.accent
+                                    Layout.fillWidth: true
+                                    Layout.alignment: Qt.AlignLeft | Qt.AlignVCenter
+                                    onToggled: root.setConfig("showTimer", !(root.cfg.showTimer !== false))
+                                }
+
+                                Text {
+                                    text: "Low power"
+                                    color: root.muted
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                                    visible: !root.isStream
+                                }
+                                ToggleSwitch {
+                                    checked: root.cfg.lowPower === true
+                                    visible: !root.isStream
+                                    foreground: root.foreground
+                                    accent: root.accent
+                                    Layout.fillWidth: true
+                                    Layout.alignment: Qt.AlignLeft | Qt.AlignVCenter
+                                    onToggled: root.setConfig("lowPower", !root.cfg.lowPower)
+                                }
+                            }
+
+                            Text {
+                                visible: root.cfg.advanced === true && root.cfg.lowPower === true && !root.isStream
+                                text: "Low power lowers GPU clocks on AMD and switches to content-aware frame mode."
+                                color: root.muted
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.bodySmall
+                                wrapMode: Text.WordWrap
+                                width: parent.width
                             }
                         }
                     }
@@ -1295,6 +2029,56 @@ Panel {
                         wrapMode: Text.WordWrap
                         width: parent.width
                     }
+
+                    // ---- Settings summary ------------------------------------------------
+                    Text {
+                        text: root.settingsSummary()
+                        visible: Boolean(text)
+                        color: root.muted
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        wrapMode: Text.WordWrap
+                        width: parent.width
+                    }
+
+                    // ---- Keyboard shortcuts hint ------------------------------------------
+                    Text {
+                        text: {
+                            if (root.replayActive)
+                                return "Esc close · S save replay · Space stop buffer";
+                            if (root.isReplay)
+                                return "Esc close · Space/Enter start buffer";
+                            return "Esc close · Space/Enter record";
+                        }
+                        color: root.muted
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        width: parent.width
+                    }
+
+                    // ---- Error log --------------------------------------------------------
+                    Repeater {
+                        model: root._errorLog
+                        Row {
+                            width: parent ? parent.width : 0
+                            spacing: Style.space(6)
+                            Text {
+                                text: "!"
+                                color: root.urgent
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.bodySmall
+                                font.bold: true
+                            }
+                            Text {
+                                text: modelData
+                                color: root.muted
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.bodySmall
+                                wrapMode: Text.WordWrap
+                                width: parent.width - Style.space(10)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1326,6 +2110,7 @@ Panel {
                 var out = text.trim();
                 if (!out || out === "cancelled" || out === "null") {
                     root._localError = "Region selection was cancelled";
+                    root._pushError("Region selection was cancelled");
                     return;
                 }
                 if (out.match(/^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/)) {
@@ -1342,6 +2127,21 @@ Panel {
         onExited: function (exitCode) {
             if (exitCode !== 0) {
                 root._localError = "Region selection failed";
+                root._pushError("Region selection failed");
+            }
+        }
+    }
+
+    // Browse button folder picker — used for the output-dir field.
+    Process {
+        id: browseDirProc
+        running: false
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var dir = text.trim();
+                if (dir && !dir.match(/^cancelled$/i))
+                    root.setConfig("outputDir", dir);
             }
         }
     }

@@ -29,6 +29,11 @@ function defaultConfig() {
     audioMicrophone: false,
     audioCodec: "aac",        // "aac" | "opus"
     audioBitrate: 0,          // 0 = auto
+    audioVolume: 100,         // 0-100, desktop audio volume
+    audioMicVolume: 100,      // 0-100, microphone volume
+    audioDesktopDevice: "default_output",
+    audioMicDevice: "default_input",
+    audioNoiseGate: false,    // noise gate/suppression via FFmpeg filter
 
     // Container
     container: "mp4",         // "mp4" | "mkv" | "webm"
@@ -42,13 +47,21 @@ function defaultConfig() {
     webcamSize: "medium",     // "small" | "medium" | "large"
 
     // Streaming (reuses the recording encode pipeline with stream overrides)
-    mode: "record",           // "record" | "stream"
+    mode: "record",           // "record" | "stream" | "replay"
     streamUrl: "",            // RTMP server URL (e.g. rtmp://push.tiktokcdn.com/live/)
     streamKey: "",            // per-session stream key (not persisted unless streamRemember)
     streamKbps: 6000,         // CBR video bitrate
     streamPlatform: "custom", // "custom" | "tiktok" | "twitch" | "youtube"
     streamRemember: false,    // persist URL/key to shell.json when true
     streamBackupLocal: false, // also save a local `-ro` copy while streaming
+
+    // Instant replay (rolling buffer, saved on command)
+    replaySeconds: 60,        // buffer length in seconds (2-86400); save = last N
+    replaySaveSeconds: 0,     // 0 = save the whole buffer
+    replayStorage: "ram",     // "ram" | "disk" (disk may shorten SSD lifespan)
+    replayKbps: 20000,        // CBR bitrate for the replay buffer (predictable RAM)
+    replayOrganize: false,    // sort replays into date-based folders (-df)
+    lowPower: false,          // reduce GPU clocks on AMD; pairs with content frame mode
 
     // UI
     advanced: false,
@@ -117,43 +130,82 @@ function streamOutput(config) {
   return url + key
 }
 
-function encodeGsrArgs(config, gpuInfo, target, streamMode) {
+// gsr `-a` source names. Explicit devices from `--list-audio-devices` use the
+// documented `device:<name>` form; the defaults pass through bare.
+function audioSourceName(device) {
+  if (device === "default_output" || device === "default_input")
+    return device
+  return "device:" + device
+}
+
+function encodeGsrArgs(config, gpuInfo, target, streamMode, replayMode) {
   var args = []
   config = resolveProfile(config, gpuInfo)
   streamMode = streamMode === true
+  replayMode = replayMode === true
 
-  // Target
+  // Target: monitor/portal get a combined `-w` capture string; region uses the
+  // `-w region` keyword plus `-region`. A webcam overlay appends to the SAME
+  // `-w` value (gsr combines sources with "|"), placed in the bottom-right.
+  var capture = "";
+  var isRegion = false;
   if (target.type === "monitor" && target.name) {
-    args.push("-w", target.name)
+    capture = target.name
   } else if (target.type === "region" && target.geometry) {
-    args.push("-w", "region", "-region", target.geometry)
+    capture = "region"
+    isRegion = true
   } else {
-    args.push("-w", "portal")
+    capture = "portal"
   }
 
-  // Codec: streams are H.264 (tune instant-feedback) regardless of the
-  // recording codec preference; recordings keep the hardware-resolved codec.
+  if (config.webcamEnabled && config.webcamDevice && config.webcamDevice !== "") {
+    var webcamSizeMap = { small: "width=20%;height=20%", medium: "width=30%;height=30%", large: "width=40%;height=40%" };
+    capture += "|" + config.webcamDevice
+      + ";halign=end;valign=end;" + (webcamSizeMap[config.webcamSize || "medium"] || webcamSizeMap.medium)
+  }
+
+  args.push("-w", capture)
+  if (isRegion)
+    args.push("-region", target.geometry)
+
+  // Persist the portal session across recordings/streams (quicker reclaim,
+  // no repeated portal permission).
+  if (capture === "portal") {
+    args.push("-restore-portal-session", "yes")
+  }
+
+  // Codec: streams stay H.264; recordings keep the hardware-resolved codec.
   var codec = streamMode ? "h264" : config.codec
   if (codec === "auto") codec = "h264"
   args.push("-k", codec)
 
-  // Bitrate mode: CBR for streaming, resolved mode for recordings.
-  var bm = streamMode ? "cbr" : config.bitrateMode
-  if (bm === "auto") bm = streamMode ? "cbr" : "qp"
+  // Bitrate mode: CBR for streaming and replay (man tip: predictable buffer
+  // RAM), resolved mode for regular recordings.
+  var bm = streamMode || replayMode ? "cbr" : config.bitrateMode
+  if (bm === "auto") bm = streamMode || replayMode ? "cbr" : "qp"
   args.push("-bm", bm)
 
-  // Quality: CBR kbps for streams, resolved preset for recordings.
-  var q = streamMode ? config.streamKbps : config.quality
+  // Quality: CBR kbps for streams and replay, resolved preset for recordings.
+  var q = streamMode ? config.streamKbps : (replayMode ? config.replayKbps : config.quality)
   if (q === "auto" || q === "" || q === undefined || q === null) {
-    q = streamMode ? 6000 : "very_high"
+    q = streamMode ? 6000 : (replayMode ? 20000 : "very_high")
   }
   args.push("-q", String(q))
 
   // Frame rate
   args.push("-f", String(config.fps || 60))
 
-  // Frame rate mode: constant for streams; recordings follow the setting.
-  args.push("-fm", streamMode ? "cfr" : (config.frameMode || "cfr"))
+  // Frame rate mode: constant for streams; recordings/replay follow the setting,
+  // and low-power mode switches to content-aware encoding (man recommendation).
+  if (streamMode) {
+    args.push("-fm", "cfr")
+  } else {
+    var fm = config.frameMode || "cfr"
+    if (config.lowPower && fm === "cfr") fm = "content"
+    args.push("-fm", fm)
+    if (config.lowPower)
+      args.push("-low-power", "yes")
+  }
 
   // Resolution
   if (config.resolution && config.resolution !== "") {
@@ -169,10 +221,9 @@ function encodeGsrArgs(config, gpuInfo, target, streamMode) {
   // Color range
   args.push("-cr", config.colorRange || "limited")
 
-  // Tune (NVIDIA only, no-op otherwise)
-  if (streamMode) {
-    args.push("-tune", "instant-feedback")
-  } else if (config.tune) {
+  // Tune (NVIDIA only, recordings only). gsr accepts only performance|quality;
+  // streams stay H.264 + CBR and pass no tune at all.
+  if (!streamMode && config.tune) {
     args.push("-tune", config.tune)
   }
 
@@ -185,8 +236,8 @@ function encodeGsrArgs(config, gpuInfo, target, streamMode) {
   // Audio
   if (config.audioEnabled) {
     var devices = []
-    if (config.audioDesktop) devices.push("default_output")
-    if (config.audioMicrophone) devices.push("default_input")
+    if (config.audioDesktop) devices.push(audioSourceName(config.audioDesktopDevice || "default_output"))
+    if (config.audioMicrophone) devices.push(audioSourceName(config.audioMicDevice || "default_input"))
     if (devices.length > 0) {
       args.push("-a", devices.join("|"))
       args.push("-ac", streamMode ? "aac" : (config.audioCodec || "aac"))
@@ -195,12 +246,24 @@ function encodeGsrArgs(config, gpuInfo, target, streamMode) {
       if (ab > 0) {
         args.push("-ab", String(ab))
       }
+      if (config.audioNoiseGate) {
+        args.push("-ffmpeg-opts", "filter:a=afftdn=nr=20,agate=threshold=0.02")
+      }
     }
   }
 
   // Streams are FLV transport.
   if (streamMode) {
     args.push("-c", "flv")
+  }
+
+  // Replay buffer: rolling `-r` buffer saved on command. `-restart-replay-on-save`
+  // clears the buffer after a save so "save replay" always clips the last N s.
+  if (replayMode) {
+    args.push("-r", String(config.replaySeconds || 60))
+    args.push("-replay-storage", config.replayStorage === "disk" ? "disk" : "ram")
+    args.push("-restart-replay-on-save", "yes")
+    args.push("-df", config.replayOrganize ? "yes" : "no")
   }
 
   // Metadata: gsr injects its own for screen recordings by default; strip it
@@ -220,9 +283,36 @@ function normalize(raw) {
     var k = keys[i]
     var v = raw && raw[k] !== undefined ? raw[k] : d[k]
     if (v === null || v === undefined) v = d[k]
+    if (k === "audioVolume" || k === "audioMicVolume") {
+      v = Number(v)
+      if (isNaN(v) || v < 0) v = d[k]
+      if (v > 100) v = 100
+    }
+    if (k === "audioDesktopDevice" || k === "audioMicDevice") {
+      if (typeof v !== "string") v = d[k]
+    }
+    if (k === "audioNoiseGate") {
+      if (typeof v !== "boolean") v = d[k]
+    }
+    if (k === "audioCodec" && ["aac", "opus", "flac"].indexOf(v) === -1) v = d[k]
     if (k === "fps" || k === "keyInterval" || k === "audioBitrate") {
       v = Number(v)
       if (isNaN(v) || v < 0) v = d[k]
+    }
+    if (k === "replayKbps") {
+      v = Number(v)
+      if (isNaN(v) || v < 0) v = d[k]
+      if (v > 100000) v = 100000
+    }
+    if (k === "replaySeconds") {
+      v = Number(v)
+      if (isNaN(v) || v < 2) v = d[k]
+      if (v > 86400) v = 86400
+    }
+    if (k === "replaySaveSeconds") {
+      v = Number(v)
+      if (isNaN(v) || v < 0) v = d[k]
+      if (v > 86400) v = 86400
     }
     if (k === "streamKbps") {
       v = Number(v)
@@ -231,18 +321,21 @@ function normalize(raw) {
       if (v > 20000) v = 20000
     }
     if (k === "cursor" || k === "audioEnabled" || k === "audioDesktop"
-        || k === "audioMicrophone" || k === "advanced" || k === "showTimer"
+        || k === "audioMicrophone" || k === "audioNoiseGate" || k === "advanced" || k === "showTimer"
         || k === "webcamEnabled" || k === "streamRemember"
-        || k === "streamBackupLocal") {
+        || k === "streamBackupLocal" || k === "replayOrganize" || k === "lowPower") {
       v = v === true || v === "true" || v === "yes" || v === 1
     }
-    if (k === "mode" && ["record", "stream"].indexOf(v) === -1) v = d[k]
+    if (k === "mode" && ["record", "stream", "replay"].indexOf(v) === -1) v = d[k]
     if (k === "streamPlatform" && ["custom", "tiktok", "twitch", "youtube"].indexOf(v) === -1) v = d[k]
     if (k === "container" && ["mp4", "mkv", "webm", "flv", "mov"].indexOf(v) === -1) v = d[k]
     if (k === "frameMode" && ["cfr", "vfr", "content"].indexOf(v) === -1) v = d[k]
     if (k === "colorRange" && ["limited", "full"].indexOf(v) === -1) v = d[k]
     if (k === "tune" && ["performance", "quality"].indexOf(v) === -1) v = d[k]
     if (k === "encoder" && ["gpu", "cpu"].indexOf(v) === -1) v = d[k]
+    if (k === "webcamSize" && ["small", "medium", "large"].indexOf(v) === -1) v = d[k]
+    if (k === "replayStorage" && ["ram", "disk"].indexOf(v) === -1) v = d[k]
+    if (k === "webcamDevice" && typeof v !== "string") v = d[k]
     out[k] = v
   }
   return out

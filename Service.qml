@@ -29,6 +29,7 @@ Item {
     property bool monitorsLoaded: false
     property var audioDevices: []
     property bool audioDevicesLoaded: false
+    property var webcamDevices: []
 
     // ── Config (defaults seeded, then shell.json overrides) ──
     property var config: Config.normalize({})
@@ -53,7 +54,7 @@ Item {
     }
 
     // ── Recording state ──
-    property string state: "idle" // idle | starting | recording | paused | stopping | error
+    property string state: "idle" // idle | starting | recording | paused | stopping | replay | error
     // Alias so the bar widget / panel can read the recording state uniformly.
     property string recordingState: state
     property bool recordingIsStream: false
@@ -67,8 +68,17 @@ Item {
     property string pendingRegion: ""   // set by pickRegion before start
     property string errorMessage: ""
 
+    // Driving the starting→replay promotion in gsr.onRunningChanged, and
+    // tagging the stop-notification so a closed buffer isn't announced as a
+    // saved recording.
+    property bool _startingReplay: false
+    property bool _wasReplay: false
+    property string _lastSavedPath: ""
+    readonly property string lastSavedPath: _lastSavedPath
+
     readonly property bool active: state === "recording" || state === "paused"
     readonly property bool paused: state === "paused"
+    readonly property bool replayActive: state === "replay"
     readonly property bool busy: state === "starting" || state === "stopping"
 
     // ── Paths ──
@@ -115,8 +125,11 @@ Item {
         mkdirs.running = true;
         refreshGpuInfo();
         refreshMonitors();
+        refreshAudioDevices();
+        refreshWebcamDevices();
         refreshConfig();
         Qt.callLater(function() { flushState() });
+        Qt.callLater(function() { applyVolume() });
     }
 
     // ── Public API (used by BarWidget / Panel) ──
@@ -136,20 +149,118 @@ Item {
         listAudioProc.running = true;
     }
 
+    function refreshWebcamDevices() {
+        listWebcamProc.command = ["gpu-screen-recorder", "--list-v4l2-devices"];
+        listWebcamProc.running = true;
+    }
+
     function toggle() {
-        if (active) {
+        if (state === "replay") {
+            stopReplay();
+        } else if (active) {
             stop();
         } else if (busy) {
             // ignore
+        } else if (config.mode === "replay") {
+            startReplay();
         } else {
             start("auto");
         }
+    }
+
+    function startReplay() {
+        if (active || busy || state === "replay")
+            return;
+        errorMessage = "";
+        applyVolume();
+
+        var target = resolveTarget("auto");
+        if (!target) {
+            if (config.targetMode === "region") {
+                pickRegion();
+                return;
+            }
+            errorMessage = "No capture target available";
+            state = "error";
+            return;
+        }
+
+        if (config.webcamEnabled && (!config.webcamDevice || config.webcamDevice === "")) {
+            errorMessage = "Webcam enabled but no device selected";
+            state = "error";
+            return;
+        }
+
+        // Replay buffer writes into the output directory and saves only on
+        // command (whole buffer; -restart-replay-on-save clears it after).
+        var args = Config.encodeGsrArgs(config, gpuInfo, target, false, true);
+        recordingIsStream = false;
+        recordingFile = "";
+        _startingReplay = true;
+        lastTarget = describeTarget(target) + " · replay buffer (" + String(config.replaySeconds || 60) + "s)";
+        state = "starting";
+        recordingElapsed = 0;
+        gsr.command = ["gpu-screen-recorder"].concat(args, ["-o", outputDir, "-ipc", ipcSocketPath]);
+        prepareDir.command = ["bash", "-c", "mkdir -p " + outputDir + " && mkdir -p " + runtimeDir];
+        prepareDir.running = true;
+        gsr.running = true;
+
+        // compatibility marker for stock pyxis indicators
+        writeMarker.command = ["bash", "-c", "mkdir -p " + runtimeDir + " && printf '%s\n' '" + outputDir + "/Replay' > " + recordingStateFilePath + " && printf '%s\n' '" + String(lastTarget) + "' > " + stateFilePath];
+        writeMarker.running = true;
+    }
+
+    function saveReplay() {
+        if (state !== "replay")
+            return;
+        // No seconds = save the whole buffer (ShadowPlay-style clip).
+        var cmd = ["python3", ipcScriptPath, ipcSocketPath, "save-replay"];
+        var clipLen = Number(root.config.replaySaveSeconds || 0);
+        if (clipLen > 0) {
+            var maxLen = Number(root.config.replaySeconds || 60) || 60;
+            if (clipLen > maxLen) clipLen = maxLen;
+            cmd.push(String(Math.round(clipLen)));
+        }
+        ipcSaveReplay.command = cmd;
+        ipcSaveReplay.running = true;
+    }
+
+    function stopReplay() {
+        if (state !== "replay")
+            return;
+        // `stop` in replay mode closes the buffer without saving it.
+        _wasReplay = true;
+        state = "stopping";
+        stopTimeout.restart();
+        if (gsr.running) {
+            ipcStop.command = ["python3", ipcScriptPath, ipcSocketPath, "stop"];
+            ipcStop.running = true;
+        } else {
+            stopTimeout.stop();
+            onRecordingSaved();
+        }
+    }
+
+    function openPath(path) {
+        if (!path)
+            return;
+        openProc.command = ["xdg-open", path];
+        openProc.running = true;
+    }
+
+    function openFolderOf(path) {
+        if (!path)
+            return;
+        var idx = path.lastIndexOf("/");
+        if (idx > 0)
+            openPath(path.substring(0, idx));
     }
 
     function start(targetType) {
         if (active || busy)
             return;
         errorMessage = "";
+        applyVolume();
 
         var streamMode = config.mode === "stream";
 
@@ -160,6 +271,12 @@ Item {
                 return;
             }
             errorMessage = "No capture target available";
+            state = "error";
+            return;
+        }
+
+        if (config.webcamEnabled && (!config.webcamDevice || config.webcamDevice === "")) {
+            errorMessage = "Webcam enabled but no device selected";
             state = "error";
             return;
         }
@@ -265,10 +382,40 @@ Item {
         copy[key] = value;
         config = Config.normalize(copy);
         persistConfig();
+        if (key === "audioVolume" || key === "audioMicVolume" || key === "audioDesktop" || key === "audioMicrophone")
+            applyVolume();
+        if (key === "audioCodec" || key === "audioBitrate")
+            persistConfig();
+        if (key === "webcamEnabled" || key === "webcamDevice" || key === "webcamSize")
+            refreshWebcamDevices();
+        if (key === "frameMode" || key === "colorRange" || key === "tune" || key === "showTimer" || key === "encoder" || key === "quality" || key === "bitrateMode")
+            persistConfig();
     }
 
     // Update config in memory only — never persist. Used for session-scoped
     // stream credentials while `streamRemember` is off.
+    function applyVolume() {
+        if (!config.audioEnabled) {
+            setWpctlVolume("DEFAULT_AUDIO_SINK", 0);
+            setWpctlVolume("DEFAULT_AUDIO_SOURCE", 0);
+            return;
+        }
+        if (config.audioDesktop)
+            setWpctlVolume("DEFAULT_AUDIO_SINK", config.audioVolume || 100);
+        else
+            setWpctlVolume("DEFAULT_AUDIO_SINK", 0);
+        if (config.audioMicrophone)
+            setWpctlVolume("DEFAULT_AUDIO_SOURCE", config.audioMicVolume || 100);
+        else
+            setWpctlVolume("DEFAULT_AUDIO_SOURCE", 0);
+    }
+
+    function setWpctlVolume(node, volumePercent) {
+        if (!wpctlProc) return;
+        wpctlProc.command = ["bash", "-c", "wpctl set-volume @" + node + "@ " + (volumePercent / 100).toFixed(2)];
+        wpctlProc.running = true;
+    }
+
     function setSessionConfig(key, value) {
         if (!config)
             return;
@@ -388,15 +535,20 @@ Item {
 
     function onRecordingSaved() {
         var wasStream = recordingIsStream;
+        var wasReplay = _wasReplay;
         var saved = recordingFile;
         recordingFile = "";
         recordingIsStream = false;
+        _wasReplay = false;
         state = "idle";
         clearMarkerProc.command = ["bash", "-c", "rm -f " + recordingStateFilePath + " " + stateFilePath];
         clearMarkerProc.running = true;
-        if (wasStream) {
+        if (wasReplay) {
+            sendNotification("Replay buffer stopped", "The rolling buffer was closed without saving.", "normal", 10000);
+        } else if (wasStream) {
             sendNotification("Stream ended", "Your live stream has stopped.", "normal", 10000);
         } else if (saved) {
+            root._lastSavedPath = saved;
             sendNotification("Screen recording saved", saved, "normal", 10000);
         }
     }
@@ -507,13 +659,24 @@ Item {
     }
 
     Process {
+        id: listWebcamProc
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                root.webcamDevices = GpuProbe.parseV4L2Devices(text);
+            }
+        }
+    }
+
+    Process {
         id: gsr
         running: false
         // gsr has no "started" signal; promote starting -> recording as soon as the
         // process is alive. A launch that dies instantly is caught by onExited.
         onRunningChanged: {
             if (gsr.running && root.state === "starting")
-                root.state = "recording";
+                root.state = root._startingReplay ? "replay" : "recording";
+            root._startingReplay = false;
         }
         onExited: function (exitCode, exitStatus) {
             stopTimeout.stop();
@@ -534,6 +697,29 @@ Item {
     Process {
         id: ipcStop
     }
+    Process {
+        id: ipcSaveReplay
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var out = String(text || "").trim();
+                if (!out)
+                    return;
+                if (out.indexOf("error") === 0) {
+                    root.sendNotification("Replay save failed", out, "critical", 8000);
+                } else {
+                    if (out !== "ok")
+                        root._lastSavedPath = out;
+                    root.sendNotification("Replay saved", out, "normal", 10000);
+                }
+            }
+        }
+    }
+    Process {
+        id: openProc
+        suppressProcessOutput: true
+    }
+
     Process {
         id: ipcPause
     }
@@ -587,6 +773,10 @@ Item {
     }
     Process {
         id: notifProc
+    }
+
+    Process {
+        id: wpctlProc
     }
 
     // Fallback when the IPC stop didn't terminate the recorder: SIGINT is
@@ -666,10 +856,13 @@ Item {
             recordingIsStream: root.recordingIsStream,
             recordingElapsed: root.recordingElapsed,
             recordingFile: root.recordingFile,
+            lastSavedPath: root.lastSavedPath,
+            replayActive: root.replayActive,
             gpuDetected: root.gpuDetected,
             gpuInfo: root.gpuInfo,
             monitors: root.monitors,
             audioDevices: root.audioDevices,
+            webcamDevices: root.webcamDevices,
             config: cfg,
             configLoaded: root.configLoaded,
             active: root.active,
@@ -703,7 +896,7 @@ Item {
 
     // State transition bookkeeping
     onStateChanged: {
-        if (state === "recording") {
+        if (state === "recording" || state === "replay") {
             recordingBaseSec = recordingElapsed;
             recordingBaseMs = Date.now();
         }
@@ -720,15 +913,15 @@ Item {
     onRecordingFileChanged: { flushState() }
     onErrorMessageChanged: { flushState() }
 
-    // Elapsed timer (only while recording)
+    // Elapsed timer (only while recording / replay buffer running)
     Timer {
         id: elapsedTimer
         interval: 1000
-        running: root.state === "recording"
+        running: root.state === "recording" || root.state === "replay"
         repeat: true
         triggeredOnStart: true
         onTriggered: {
-            if (root.state === "recording") {
+            if (root.state === "recording" || root.state === "replay") {
                 root.recordingElapsed = root.recordingBaseSec + Math.floor((Date.now() - root.recordingBaseMs) / 1000);
             }
         }
@@ -766,6 +959,36 @@ Item {
 
         function stop(): string {
             root.stop();
+            return "ok";
+        }
+
+        function replay(a: string): string {
+            root.startReplay();
+            return "ok";
+        }
+
+        function startReplay(): string {
+            root.startReplay();
+            return "ok";
+        }
+
+        function saveReplay(): string {
+            root.saveReplay();
+            return "ok";
+        }
+
+        function stopReplay(): string {
+            root.stopReplay();
+            return "ok";
+        }
+
+        function openClip(): string {
+            root.openPath(root.lastSavedPath);
+            return "ok";
+        }
+
+        function openFolder(): string {
+            root.openFolderOf(root.lastSavedPath);
             return "ok";
         }
 

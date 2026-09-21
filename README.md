@@ -9,6 +9,14 @@ automatic hardware and encoder detection.
 ## Features
 
 - One-click record/stop from the bar widget (left click toggle, right click panel)
+- **Volume sliders** for desktop audio and microphone (applied via PipeWire/wpctl)
+- **Audio device selectors** for desktop and mic (fed by `gpu-screen-recorder --list-audio-devices`, drive gsr's `-a` capture sources directly)
+- **Audio codec (AAC/Opus) and bitrate** control (0–512 kbps, auto when 0)
+- **Noise gate** via FFmpeg's `afftdn`+`agate` filter
+- **Webcam overlay** for recordings and streams: enable/disable, device, size — composited into the capture (`-w target|/dev/video0`, bottom-right)
+- **Portal session restore** (`-restore-portal-session`) persists your Wayland portal session across recordings
+- **Instant replay** (third mode): rolling buffer of the last N seconds stored in RAM or on disk (CBR for predictable RAM) — save a clip from the panel button or the **S** key, then the buffer restarts
+- **Low-power capture** (AMD): reduces GPU clocks and switches to content-aware frame mode
 - **Auto-optimized encoder settings** based on detected GPU vendor + available codecs:
   - NVIDIA — HEVC (H.265) → H.264 fallback, VBR, very-high, performance tune
   - AMD / Intel — AV1 → HEVC → H.264, VBR, very-high/high, performance tune

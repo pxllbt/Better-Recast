@@ -68,3 +68,17 @@ function parseAudioDevices(text) {
   }
   return devices
 }
+
+function parseV4L2Devices(text) {
+  var devices = []
+  var lines = String(text || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim()
+    if (!line || line.indexOf("/dev/") !== 0) continue
+    var parts = line.split("|")
+    devices.push({ path: parts[0].trim(), name: parts.length > 1 && parts[1].trim() ? parts[1].trim() : parts[0].trim() })
+  }
+  if (devices.length === 0)
+    devices.push({ path: "", name: "No webcam found" })
+  return devices
+}

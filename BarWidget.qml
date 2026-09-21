@@ -97,8 +97,15 @@ BarWidget {
             panelLoader.item.service = root.service;
     }
 
-    readonly property bool recording: stateText === "recording" || stateText === "paused" || stateText === "starting"
+    readonly property bool recording: stateText === "recording" || stateText === "paused" || stateText === "starting" || stateText === "replay"
     readonly property bool pausedState: stateText === "paused"
+    readonly property bool replayActive: stateText === "replay"
+    readonly property bool replayMode: Boolean(root.service
+        ? (root.service.config && root.service.config.mode === "replay")
+        : (root.serviceState.config && root.serviceState.config.mode === "replay"))
+    readonly property int replaySeconds: root.service
+        ? (root.service.config ? (root.service.config.replaySeconds || 60) : 60)
+        : (root.serviceState.config ? (root.serviceState.config.replaySeconds || 60) : 60)
     readonly property bool streaming: Boolean(root.service
         ? (root.service.config && (root.service.config.mode || "record") === "stream")
         : (root.serviceState.config && (root.serviceState.config.mode || "record") === "stream"))
@@ -138,9 +145,13 @@ BarWidget {
             panelLoader.item.closeForPopoutSwitch();
     }
 
-    readonly property string glyphText: recording ? (streaming ? "●" : (pausedState ? "󰏥" : "󰻂")) : "󰻂"
-    readonly property color glyphColor: recording ? (streaming ? Color.urgent : Color.accent) : (root.bar ? root.bar.barForeground : Color.foreground)
-    readonly property string tooltip: recording ? (pausedState ? "Paused" : (streaming ? "Live" : "Recording")) + " · " + formatElapsed(elapsed) + "\nLeft-click to stop · Right-click panel" : (streaming ? "Screen Recorder\nLeft-click to go live · Right-click panel" : "Screen Recorder\nLeft-click to record · Right-click panel")
+    readonly property string glyphText: replayActive ? "󰻂" : (recording ? (streaming ? "●" : (pausedState ? "󰏥" : "󰻂")) : "󰻂")
+    readonly property color glyphColor: replayActive
+        ? (root.bar ? root.bar.barForeground : Color.foreground)
+        : (recording ? (streaming ? Color.urgent : Color.accent) : (root.bar ? root.bar.barForeground : Color.foreground))
+    readonly property string tooltip: replayActive
+        ? ("Replay buffer · last " + root.replaySeconds + "s · " + root.formatElapsed(root.elapsed) + "\nLeft-click stop buffer · Right-click panel (S saves)")
+        : (recording ? (pausedState ? "Paused" : (streaming ? "Live" : "Recording")) + " · " + formatElapsed(elapsed) + "\nLeft-click to stop · Right-click panel" : (streaming ? "Screen Recorder\nLeft-click to go live · Right-click panel" : "Screen Recorder\nLeft-click to record · Right-click panel"))
 
     onBarChanged: {
         refresh();

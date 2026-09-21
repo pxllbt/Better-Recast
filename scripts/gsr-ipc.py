@@ -8,7 +8,10 @@ Commands:
     status          Check if gsr is running (prints "running" or "not running")
     toggle-pause    Pause/unpause recording
     set-paused      Pause (true) or unpause (false) — requires argument
-    stop            Stop and save recording
+    stop            Stop and save recording (replay mode: stop WITHOUT save)
+    save-replay     Save the replay buffer (replay mode). Optional seconds arg;
+                    omitting it saves the whole buffer. Prints the saved file path
+    stop-replay-recording  Stop the regular recording running during replay/stream
 """
 
 import socket
