@@ -161,7 +161,7 @@ Item {
     }
 
     function toggle() {
-        if (state === "replay") {
+        if (state === "replay" && config.mode === "replay") {
             stopReplay();
         } else if (active) {
             stop();
@@ -358,12 +358,6 @@ Item {
         }
     }
 
-    // Immediate stop for tests / emergency — sends SIGINT to the recorder.
-    function kill() {
-        if (gsr.running)
-            gsr.signal(2); // SIGINT
-    }
-
     function pause() {
         if (state !== "recording")
             return;
@@ -390,14 +384,12 @@ Item {
         copy[key] = value;
         config = Config.normalize(copy);
         persistConfig();
+        if (key === "mode" && config.mode !== "replay" && state === "replay")
+            state = "idle";
         if (key === "audioVolume" || key === "audioMicVolume" || key === "audioDesktop" || key === "audioMicrophone")
             applyVolume();
-        if (key === "audioCodec" || key === "audioBitrate")
-            persistConfig();
         if (key === "webcamEnabled" || key === "webcamDevice" || key === "webcamSize")
             refreshWebcamDevices();
-        if (key === "frameMode" || key === "colorRange" || key === "tune" || key === "showTimer" || key === "encoder" || key === "quality" || key === "bitrateMode")
-            persistConfig();
     }
 
     // Update config in memory only — never persist. Used for session-scoped
@@ -408,19 +400,14 @@ Item {
             setWpctlVolume("DEFAULT_AUDIO_SOURCE", 0);
             return;
         }
-        // Snapshot current volume before overriding it
+        // Read both volumes first, then override. Reading must complete
+        // before setting so restoreVolume() has the correct old levels.
         _savedAudioSinkVolume = 1.0;
         _savedAudioSourceVolume = 0.0;
-        volReadProc.command = ["bash", "-c", "wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null | awk '{print $2}'"];
+        volReadProc.command = ["bash", "-c",
+            "wpctl get-volume @DEFAULT_AUDIO_SINK@ @DEFAULT_AUDIO_SOURCE@ 2>/dev/null | awk '{print $2, $4}'"
+        ];
         volReadProc.running = true;
-        if (config.audioDesktop)
-            setWpctlVolume("DEFAULT_AUDIO_SINK", config.audioVolume || 100);
-        else
-            setWpctlVolume("DEFAULT_AUDIO_SINK", 0);
-        if (config.audioMicrophone)
-            setWpctlVolume("DEFAULT_AUDIO_SOURCE", config.audioMicVolume || 100);
-        else
-            setWpctlVolume("DEFAULT_AUDIO_SOURCE", 0);
     }
 
     function setWpctlVolume(node, volumePercent) {
@@ -548,6 +535,8 @@ Item {
         }
         config = Config.normalize(merged);
         configLoaded = true;
+        if (config.mode !== "replay" && state === "replay")
+            state = "idle";
         return true;
     }
 
@@ -575,13 +564,19 @@ Item {
     function onRecordingFailed(msg) {
         errorMessage = msg;
         var wasStream = recordingIsStream;
+        var wasReplay = _wasReplay;
         var saved = recordingFile;
         recordingFile = "";
         recordingIsStream = false;
+        _wasReplay = false;
         state = "idle";
         clearMarkerProc.command = ["bash", "-c", "rm -f " + recordingStateFilePath + " " + stateFilePath];
         clearMarkerProc.running = true;
-        sendNotification(wasStream ? "Stream ended unexpectedly" : "Screen recording failed", msg, "critical", 8000);
+        if (wasReplay) {
+            sendNotification("Replay buffer crashed", msg, "critical", 8000);
+        } else {
+            sendNotification(wasStream ? "Stream ended unexpectedly" : "Screen recording failed", msg, "critical", 8000);
+        }
         restoreVolume();
     }
 
@@ -799,16 +794,25 @@ Item {
         id: wpctlProc
     }
 
-    // Reads current desktop volume before applyVolume() overrides it,
-    // so restoreVolume() can put it back when recording stops.
     Process {
         id: volReadProc
         stdout: StdioCollector {
             waitForEnd: true
             onStreamFinished: {
                 var out = String(text || "").trim()
-                var m = out.match(/([0-9.]+)/)
-                if (m) root._savedAudioSinkVolume = parseFloat(m[1])
+                var parts = out.split(/\s+/)
+                var sink = parseFloat(parts[0])
+                var source = parseFloat(parts[1])
+                if (!isNaN(sink)) root._savedAudioSinkVolume = sink
+                if (!isNaN(source)) root._savedAudioSourceVolume = source
+                if (config.audioDesktop)
+                    setWpctlVolume("DEFAULT_AUDIO_SINK", config.audioVolume || 100)
+                else
+                    setWpctlVolume("DEFAULT_AUDIO_SINK", 0)
+                if (config.audioMicrophone)
+                    setWpctlVolume("DEFAULT_AUDIO_SOURCE", config.audioMicVolume || 100)
+                else
+                    setWpctlVolume("DEFAULT_AUDIO_SOURCE", 0)
             }
         }
     }

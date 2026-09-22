@@ -410,7 +410,7 @@ Panel {
     }
 
     function saveReplay() {
-        if (!root.replayActive)
+        if (!root.isReplay)
             return;
         if (root.service && typeof root.service.saveReplay === "function") {
             root.service.saveReplay();
@@ -462,7 +462,7 @@ Panel {
             onCloseRequested: root.requestClose()
             onActivateRequested: root.toggleRecording()
             onTextKey: function(t) {
-                if ((t === "s" || t === "S") && root.replayActive)
+                if ((t === "s" || t === "S") && root.isReplay)
                     root.saveReplay();
             }
 
@@ -569,16 +569,18 @@ Panel {
                         text: {
                             if (root.busy)
                                 return root.state === "starting" ? "Starting…" : "Stopping…";
-                            if (root.replayActive)
-                                return "▶  Save replay";
-                            if (root.recording)
-                                return root.paused ? "▶  Resume" : (root.isStream ? "■  Stop stream" : "■  Stop");
                             if (root.isReplay)
                                 return "●  Start buffer";
+                            if (root.recording)
+                                return root.paused ? "▶  Resume" : (root.isStream ? "■  Stop stream" : "■  Stop");
+                            if (root.replayActive)
+                                return "▶  Save replay";
                             return root.isStream ? "●  Go live" : "●  Record";
                         }
                         onClicked: {
-                            if (root.replayActive)
+                            if (root.isReplay)
+                                root.toggleRecording();
+                            else if (root.replayActive)
                                 root.saveReplay();
                             else
                                 root.toggleRecording();
@@ -589,7 +591,7 @@ Panel {
                     RowLayout {
                         width: parent.width
                         spacing: Style.space(8)
-                        visible: root.replayActive
+                        visible: root.isReplay
 
                         Button {
                             text: "Save replay"

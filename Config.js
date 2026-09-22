@@ -264,6 +264,7 @@ function encodeGsrArgs(config, gpuInfo, target, streamMode, replayMode) {
     args.push("-replay-storage", config.replayStorage === "disk" ? "disk" : "ram")
     args.push("-restart-replay-on-save", "yes")
     args.push("-df", config.replayOrganize ? "yes" : "no")
+    args.push("-c", config.container || "mp4")
   }
 
   // Metadata: gsr injects its own for screen recordings by default; strip it
