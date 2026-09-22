@@ -73,11 +73,11 @@ def main():
             chunk = s.recv(4096)
             if not chunk:
                 break
-            buf += chunk
-            if len(buf) > MAX_BUF:
+            if len(buf) + len(chunk) > MAX_BUF:
                 s.close()
                 print("error: reply too large", file=sys.stderr)
                 sys.exit(1)
+            buf += chunk
             for line in buf.decode().split("\n"):
                 line = line.strip()
                 if not line:

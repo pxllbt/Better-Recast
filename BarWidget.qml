@@ -266,9 +266,9 @@ BarWidget {
                 }
             }
         }
-        onEntered: if (root.bar)
+        onEntered: if (root.bar && typeof root.bar.showTooltip === "function")
             root.bar.showTooltip(root, root.tooltip)
-        onExited: if (root.bar)
+        onExited: if (root.bar && typeof root.bar.hideTooltip === "function")
             root.bar.hideTooltip(root)
     }
 

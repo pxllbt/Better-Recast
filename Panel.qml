@@ -2030,6 +2030,7 @@ Panel {
 
                             Text {
                                 text: "v" + root.updateCurrentVersion + " → v" + root.updateNewVersion + (root.updateCommitsBehind > 0 ? " (" + root.updateCommitsBehind + " commits)" : "")
+                                textFormat: Text.PlainText
                                 color: root.accent
                                 font.family: root.fontFamily
                                 font.pixelSize: Style.font.caption
@@ -2254,7 +2255,19 @@ Panel {
                     }
         }
         onExited: function (exitCode) {
+            updateCheckTimer.stop();
             root.updateChecking = false;
+        }
+    }
+    Timer {
+        id: updateCheckTimer
+        interval: 30000
+        repeat: false
+        onTriggered: {
+            if (updateCheckProc.running) {
+                updateCheckProc.running = false;
+                root.updateChecking = false;
+            }
         }
     }
 

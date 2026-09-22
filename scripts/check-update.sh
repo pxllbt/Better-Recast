@@ -30,17 +30,22 @@ error=""
 
 MAX_REMOTE_SIZE=65536
 remote_json=""
-remote_json=$(curl -fsSL --max-time 10 "$RAW_URL" 2>/dev/null | head -c "$MAX_REMOTE_SIZE") || error="network"
+remote_json=$(curl -fsSL --max-time 10 "$RAW_URL" 2>/dev/null | head -c "$((MAX_REMOTE_SIZE + 1))") || error="network"
 if [[ -n "$remote_json" && ${#remote_json} -gt "$MAX_REMOTE_SIZE" ]]; then
   error="response too large"
   remote_json=""
 fi
 if [[ -n "$remote_json" ]]; then
   new_version=$(jq -r '.version // empty' <<<"$remote_json" 2>/dev/null || echo "")
+  # Reject arbitrary version strings — must be semver-like
+  if [[ -n "$new_version" && ! "$new_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+)?$ ]]; then
+    error="invalid version format"
+    new_version=""
+  fi
 fi
 
 if git -C "$PLUGIN_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-  if git -C "$PLUGIN_DIR" fetch --quiet origin "$BRANCH" 2>/dev/null; then
+  if timeout 30 git -C "$PLUGIN_DIR" fetch --quiet origin "$BRANCH" 2>/dev/null; then
     new_commit_full=$(git -C "$PLUGIN_DIR" rev-parse --short FETCH_HEAD 2>/dev/null || echo "")
     commits_behind=$(git -C "$PLUGIN_DIR" rev-list --count HEAD..FETCH_HEAD 2>/dev/null || echo 0)
     if [[ "$commits_behind" -gt 0 ]]; then
