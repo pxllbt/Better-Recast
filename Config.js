@@ -121,13 +121,10 @@ function streamPlatformDefaults(platform) {
 }
 
 function streamOutput(config) {
-  // Concatenate server URL + stream key into a single gsr `-o` target.
-  // gsr accepts "rtmp://host/app/key" or, when the URL ends in a key slot,
-  // "rtmp://host/app/streamKey".
-  var url = String(config.streamUrl || "").trim()
-  var key = String(config.streamKey || "").trim()
-  if (url.charAt(url.length - 1) !== "/" && url.length > 0 && key.length > 0) url += "/"
-  return url + key
+  // Return the RTMP server URL without the stream key.
+  // The stream key is passed via the GSR_AUTH environment variable
+  // (see Service.qml) to keep it out of /proc/<pid>/cmdline.
+  return String(config.streamUrl || "").trim()
 }
 
 // gsr `-a` source names. Explicit devices from `--list-audio-devices` use the

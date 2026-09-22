@@ -109,6 +109,8 @@ BarWidget {
     readonly property bool streaming: Boolean(root.service
         ? (root.service.config && (root.service.config.mode || "record") === "stream")
         : (root.serviceState.config && (root.serviceState.config.mode || "record") === "stream"))
+    readonly property bool updateAvailable: panelLoader.item ? (panelLoader.item.updateAvailable === true) : false
+    readonly property string updateVersionText: panelLoader.item ? (panelLoader.item.updateNewVersion || "") : ""
 
     function formatElapsed(sec) {
         var h = Math.floor(sec / 3600);
@@ -149,9 +151,12 @@ BarWidget {
     readonly property color glyphColor: replayActive
         ? (root.bar ? root.bar.barForeground : Color.foreground)
         : (recording ? (streaming ? Color.urgent : Color.accent) : (root.bar ? root.bar.barForeground : Color.foreground))
-    readonly property string tooltip: replayActive
+    readonly property string tooltipBase: replayActive
         ? ("Replay buffer · last " + root.replaySeconds + "s · " + root.formatElapsed(root.elapsed) + "\nLeft-click stop buffer · Right-click panel (S saves)")
         : (recording ? (pausedState ? "Paused" : (streaming ? "Live" : "Recording")) + " · " + formatElapsed(elapsed) + "\nLeft-click to stop · Right-click panel" : (streaming ? "Screen Recorder\nLeft-click to go live · Right-click panel" : "Screen Recorder\nLeft-click to record · Right-click panel"))
+    readonly property string tooltip: (updateAvailable && !replayActive && !recording)
+        ? tooltipBase + "\nUpdate available: v" + updateVersionText + "\nRight-click panel to check"
+        : tooltipBase
 
     onBarChanged: {
         refresh();

@@ -294,8 +294,11 @@ Item {
 
         if (streamMode) {
             // gsr streams the compositor capture to any RTMP/WHIP URL passed to -o.
+            // The stream key is passed via the GSR_AUTH environment variable,
+            // not embedded in the URL, to keep it out of /proc/<pid>/cmdline.
             var streamUrl = Config.streamOutput(config);
-            if (!streamUrl) {
+            var streamKey = String(config.streamKey || "").trim();
+            if (!streamUrl || !streamKey) {
                 recordingIsStream = false;
                 errorMessage = "Set a stream URL and key to go live";
                 state = "error";
@@ -310,6 +313,7 @@ Item {
             state = "starting";
             recordingElapsed = 0;
             gsr.command = ["gpu-screen-recorder"].concat(args);
+            gsr.environment = {"GSR_AUTH": streamKey};
             gsr.running = true;
             // Ensure the IPC socket dir (and the output dir when a local copy is
             // requested) exists before the recorder starts.
@@ -411,7 +415,6 @@ Item {
     }
 
     function setWpctlVolume(node, volumePercent) {
-        if (!wpctlProc) return;
         wpctlProc.command = ["bash", "-c", "wpctl set-volume @" + node + "@ " + (volumePercent / 100).toFixed(2)];
         wpctlProc.running = true;
     }
@@ -434,9 +437,9 @@ Item {
             return;
         var entries = {};
         for (var k in config) {
-            // Session-only stream key must never land in shell.json unless the
-            // user explicitly asked to remember it.
             if (k === "streamKey" && config.streamRemember !== true)
+                continue;
+            if (k === "_lastMonitor" || k === "_lastRegion")
                 continue;
             entries[k] = config[k];
         }
@@ -562,6 +565,7 @@ Item {
     }
 
     function onRecordingFailed(msg) {
+        _startingReplay = false;
         errorMessage = msg;
         var wasStream = recordingIsStream;
         var wasReplay = _wasReplay;
@@ -865,11 +869,6 @@ Item {
                 } else {
                     root.onRecordingFailed("Recording file missing or empty — write may have been interrupted");
                 }
-            }
-        }
-        onExited: function (exitCode) {
-            if (exitCode !== 0) {
-                root.onRecordingFailed("Recording file verification failed");
             }
         }
     }

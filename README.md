@@ -38,11 +38,21 @@ automatic hardware and encoder detection.
 ## Install
 
 ```
-omarchy plugin add /path/to/pix.recast
+omarchy plugin add https://github.com/pxllbt/Better-Recast.git --enable
 omarchy plugin enable pix.recast
 omarchy-shell shell toggle pix.recast   # open the control panel
 omarchy-shell bar layout right add pix.recast   # add the bar indicator
 ```
+
+## Update
+
+The control panel checks for updates automatically (~6h interval) and shows a banner when a new version is available. You can also check manually from the panel or run:
+
+```
+omarchy plugin update pix.recast
+```
+
+This fetches the latest changes from `origin/main`, shows a diff, and fast-forwards the checkout after validation. Updates are always manual and require your confirmation.
 
 ## Development
 

@@ -18,6 +18,8 @@ import socket
 import sys
 import json
 
+MAX_BUF = 65536
+
 
 def main():
     if len(sys.argv) < 3:
@@ -65,12 +67,17 @@ def main():
         s.sendall(json.dumps(request).encode() + b"\n")
 
         # Read reply (may be multi-line, find matching id)
+        # Cap buffer to prevent unbounded growth from a slow/stuck peer.
         buf = b""
         while True:
             chunk = s.recv(4096)
             if not chunk:
                 break
             buf += chunk
+            if len(buf) > MAX_BUF:
+                s.close()
+                print("error: reply too large", file=sys.stderr)
+                sys.exit(1)
             for line in buf.decode().split("\n"):
                 line = line.strip()
                 if not line:

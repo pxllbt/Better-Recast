@@ -68,6 +68,14 @@ Panel {
     property var hostWidget: null
     property string omarchyPath: ""
 
+    // ---- update check -----------------------------------------------------
+    property bool updateAvailable: false
+    property string updateCurrentVersion: "1.1.0"
+    property string updateNewVersion: ""
+    property int updateCommitsBehind: 0
+    property bool updateChecking: false
+    property string updateError: ""
+
     // ---- theme --------------------------------------------------------------
     readonly property color foreground: Color.foreground
     readonly property color background: Color.background
@@ -1983,6 +1991,83 @@ Panel {
                         }
                     }
 
+                    // ---- UPDATE --------------------------------------------------------
+                    Column {
+                        width: parent.width
+                        spacing: Style.space(6)
+
+                        PanelSectionHeader {
+                            text: "UPDATE"
+                            foreground: root.foreground
+                            fontFamily: root.fontFamily
+                        }
+
+                        Row {
+                            width: parent.width
+                            spacing: Style.space(8)
+                            visible: !root.updateAvailable || root.updateChecking
+
+                            Text {
+                                text: root.updateChecking
+                                    ? "Checking for updates…"
+                                    : "Up to date" + (root.updateNewVersion !== "" ? " (v" + root.updateCurrentVersion + ")" : "")
+                                color: root.muted
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+
+                            Button {
+                                text: "Check"
+                                onClicked: root.checkForUpdates()
+                            }
+                        }
+
+                        Row {
+                            width: parent.width
+                            spacing: Style.space(8)
+                            visible: root.updateAvailable && !root.updateChecking
+
+                            Text {
+                                text: "v" + root.updateCurrentVersion + " → v" + root.updateNewVersion + (root.updateCommitsBehind > 0 ? " (" + root.updateCommitsBehind + " commits)" : "")
+                                color: root.accent
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+
+                            Item {
+                                Layout.fillWidth: true
+                            }
+
+                            Button {
+                                text: "Copy command"
+                                onClicked: {
+                                    copyUpdateCmdProc.command = ["sh", "-c", "printf '%s' \"$1\" | wl-copy", "_", "omarchy plugin update pix.recast"];
+                                    copyUpdateCmdProc.running = true;
+                                }
+                            }
+
+                            Button {
+                                text: "Update"
+                                accent: root.accent
+                                onClicked: {
+                                    Util.execDetached("omarchy-launch-floating-terminal-with-presentation 'omarchy plugin update pix.recast'");
+                                }
+                            }
+                        }
+
+                        Text {
+                            visible: root.updateError !== "" && !root.updateChecking
+                            text: "Update check failed — " + root.updateError
+                            color: root.urgent
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                            wrapMode: Text.WordWrap
+                            width: parent.width
+                        }
+                    }
+
                     PanelSeparator {
                         foreground: root.foreground
                     }
@@ -2139,5 +2224,65 @@ Panel {
                     root.setConfig("outputDir", dir);
             }
         }
+    }
+
+    // ---- Update checker ---------------------------------------------------
+    readonly property string updateCheckerPath: {
+        var u = Qt.resolvedUrl("scripts/check-update.sh").toString();
+        return decodeURIComponent(u.replace(/^file:\/\//, ""));
+    }
+
+    Process {
+        id: updateCheckProc
+        command: [root.updateCheckerPath, "check"]
+        stdout: StdioCollector {
+            waitForEnd: true
+                    onStreamFinished: {
+                        var line = String(text || "").trim();
+                        if (line.length > 65536)
+                            line = line.substring(0, 65536);
+                        if (!line) return;
+                        try {
+                            var data = JSON.parse(line);
+                            root.updateAvailable = data.update_available === true;
+                            root.updateCurrentVersion = data.current_version || "1.1.0";
+                            root.updateNewVersion = data.new_version || "";
+                            root.updateCommitsBehind = data.commits_behind || 0;
+                            root.updateError = data.error || "";
+                        } catch (e) {}
+                        root.updateChecking = false;
+                    }
+        }
+        onExited: function (exitCode) {
+            root.updateChecking = false;
+        }
+    }
+
+    Timer {
+        id: updateCheckStartup
+        interval: 10000
+        running: true
+        repeat: false
+        onTriggered: root.checkForUpdates()
+    }
+
+    Timer {
+        id: updateCheckRecurring
+        interval: 21600000
+        running: true
+        repeat: true
+        onTriggered: root.checkForUpdates()
+    }
+
+    function checkForUpdates() {
+        root.updateChecking = true;
+        root.updateError = "";
+        if (!updateCheckProc.running)
+            updateCheckProc.running = true;
+    }
+
+    Process {
+        id: copyUpdateCmdProc
+        running: false
     }
 }

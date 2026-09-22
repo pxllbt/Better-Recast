@@ -28,19 +28,6 @@ function parseGsrInfo(text) {
   return info
 }
 
-function parseNvidiaSmi(text) {
-  var result = { name: "", driverVersion: "" }
-  var lines = String(text || "").split("\n")
-  for (var i = 0; i < lines.length; i++) {
-    var parts = lines[i].split(", ")
-    if (parts.length >= 3) {
-      result.name = (parts[1] || "").trim()
-      result.driverVersion = (parts[2] || "").trim()
-    }
-  }
-  return result
-}
-
 function parseMonitorList(text) {
   var monitors = []
   var lines = String(text || "").split("\n")
