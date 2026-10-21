@@ -37,6 +37,29 @@ Item {
      * the repo's 6.1.0), and a string comparison would then advertise an
      * "update" that is actually a downgrade.
      */
+    /**
+     * Quote a value for literal use inside a shell command.
+     *
+     * The output directory is ANY path the user picks with the folder browser,
+     * and a path can contain a dollar sign, a backtick, a semicolon or a
+     * command substitution. Interpolated inside DOUBLE QUOTES, `$(...)` and
+     * backticks are still expanded by the shell -- so a directory named
+     * `$(touch /tmp/pwned)` ran its own command as the desktop user, the
+     * moment a recording started.
+     *
+     * Single quotes make everything literal, and the only character that
+     * cannot appear inside a single-quoted string is a single quote itself --
+     * which is escaped by ending the quote, adding an escaped quote, and
+     * reopening it.
+     *
+     * Every value that reaches a shell goes through here. The app-controlled
+     * ones are quoted too: a device node name comes from the system, and the
+     * system is not the trust boundary here.
+     */
+    function shellQuote(value) {
+        return "'" + String(value).replace(/'/g, "'\\''") + "'";
+    }
+
     function versionNewer(a, b) {
         var pa = String(a || "").split(".").map(Number);
         var pb = String(b || "").split(".").map(Number);
@@ -326,7 +349,7 @@ Item {
         }
         // Quoted on purpose: the output dir is user-chosen and may contain
         // spaces. Names with newlines cannot occur, so the line split is safe.
-        command: ["bash", "-c", "ls -1t \"" + outputDir + "\" 2>/dev/null | head -6"]
+        command: ["bash", "-c", "ls -1t " + shellQuote(outputDir) + " 2>/dev/null | head -6"]
     }
 
     // Re-read the output directory for the panel's recent list.
@@ -426,7 +449,7 @@ Item {
 
     // ── Startup ──
     Component.onCompleted: {
-        mkdirs.command = ["bash", "-c", "mkdir -p " + runtimeDir + " && rm -f " + ipcSocketPath];
+        mkdirs.command = ["bash", "-c", "mkdir -p " + shellQuote(runtimeDir) + " && rm -f " + shellQuote(ipcSocketPath)];
         mkdirs.running = true;
         reapOrphanRecorders();
         refreshGpuInfo();
@@ -450,7 +473,7 @@ Item {
                 "  kill -2 \"$pid\" 2>/dev/null || true; " +
                 "  sleep 1; " +
                 "  kill -9 \"$pid\" 2>/dev/null || true; " +
-                "done; rm -f " + ipcSocketPath
+                "done; rm -f " + shellQuote(ipcSocketPath)
             ];
             orphanReapProc.running = false;
             orphanReapProc.running = true;
@@ -548,12 +571,12 @@ Item {
         resetElapsed();
         startWatchdog.restart();
         gsr.command = ["gpu-screen-recorder"].concat(args, ["-o", outputDir, "-ipc", ipcSocketPath]);
-        prepareDir.command = ["bash", "-c", "mkdir -p " + outputDir + " && mkdir -p " + runtimeDir];
+        prepareDir.command = ["bash", "-c", "mkdir -p " + shellQuote(outputDir) + " && mkdir -p " + shellQuote(runtimeDir)];
         prepareDir.running = true;
         gsr.running = true;
 
         // compatibility marker for stock pyxis indicators
-        writeMarker.command = ["bash", "-c", "mkdir -p " + runtimeDir + " && printf '%s\n' '" + outputDir + "/Replay' > " + recordingStateFilePath + " && printf '%s\n' '" + String(lastTarget) + "' > " + stateFilePath];
+        writeMarker.command = ["bash", "-c", "mkdir -p " + shellQuote(runtimeDir) + " && printf '%s\n' '" + shellQuote(outputDir + "/Replay") + " > " + shellQuote(recordingStateFilePath) + " && printf '%s\n' '" + shellQuote(String(lastTarget)) + " > " + shellQuote(stateFilePath)];
         writeMarker.running = true;
     }
 
@@ -739,7 +762,7 @@ Item {
             gsr.running = true;
             // Ensure the IPC socket dir (and the output dir when a local copy is
             // requested) exists before the recorder starts.
-            prepareDir.command = ["bash", "-c", "mkdir -p \"" + outputDir + "\" && mkdir -p \"" + runtimeDir + "\""];
+            prepareDir.command = ["bash", "-c", "mkdir -p " + shellQuote(outputDir) + " && mkdir -p " + shellQuote(runtimeDir)];
             prepareDir.running = true;
             return;
         }
@@ -751,7 +774,7 @@ Item {
         args.unshift("gpu-screen-recorder");
 
         // ensure output dir (with the date subdir, when organizing) + runtime state
-        prepareDir.command = ["bash", "-c", "mkdir -p \"" + fileDir + "\" && mkdir -p \"" + runtimeDir + "\""];
+        prepareDir.command = ["bash", "-c", "mkdir -p " + shellQuote(fileDir) + " && mkdir -p " + shellQuote(runtimeDir)];
         prepareDir.running = true;
 
         lastTarget = describeTarget(target);
@@ -762,7 +785,7 @@ Item {
         gsr.running = true;
 
         // compatibility marker for stock pyxis indicators
-        writeMarker.command = ["bash", "-c", "mkdir -p " + runtimeDir + " && printf '%s\n' '" + recordingFile + "' > " + recordingStateFilePath + " && printf '%s\n' '" + String(lastTarget) + "' > " + stateFilePath];
+        writeMarker.command = ["bash", "-c", "mkdir -p " + shellQuote(runtimeDir) + " && printf '%s\n' '" + shellQuote(recordingFile) + " > " + shellQuote(recordingStateFilePath) + " && printf '%s\n' '" + shellQuote(String(lastTarget)) + " > " + shellQuote(stateFilePath)];
         writeMarker.running = true;
     }
 
@@ -936,7 +959,7 @@ Item {
     }
 
     function setWpctlVolume(node, volumePercent) {
-        wpctlProc.command = ["bash", "-c", "wpctl set-volume @" + node + "@ " + (volumePercent / 100).toFixed(2)];
+        wpctlProc.command = ["bash", "-c", "wpctl set-volume " + shellQuote("@" + node + "@") + " " + (volumePercent / 100).toFixed(2)];
         wpctlProc.running = true;
     }
 
@@ -1084,7 +1107,7 @@ Item {
         recordingIsStream = false;
         _wasReplay = false;
         state = "idle";
-        clearMarkerProc.command = ["bash", "-c", "rm -f " + recordingStateFilePath + " " + stateFilePath];
+        clearMarkerProc.command = ["bash", "-c", "rm -f " + shellQuote(recordingStateFilePath) + " " + shellQuote(stateFilePath)];
         clearMarkerProc.running = true;
         if (wasReplay) {
             sendNotification("Replay buffer stopped", "The rolling buffer was closed without saving.", "normal", 10000);
@@ -1109,7 +1132,7 @@ Item {
         recordingIsStream = false;
         _wasReplay = false;
         state = "idle";
-        clearMarkerProc.command = ["bash", "-c", "rm -f " + recordingStateFilePath + " " + stateFilePath];
+        clearMarkerProc.command = ["bash", "-c", "rm -f " + shellQuote(recordingStateFilePath) + " " + shellQuote(stateFilePath)];
         clearMarkerProc.running = true;
         if (wasReplay) {
             sendNotification("Replay buffer crashed", msg, "critical", 8000);
@@ -1298,7 +1321,7 @@ Item {
                 }
             }
         }
-        command: ["bash", "-c", "df -Pk \"" + outputDir + "\""]
+        command: ["bash", "-c", "df -Pk " + shellQuote(outputDir)]
     }
 
     // Autonomous low-disk space watchdog: polls free disk space every 10 seconds
@@ -1310,7 +1333,7 @@ Item {
         running: root.state === "recording" && !root.recordingIsStream
         onTriggered: {
             if (!diskProbe.running) {
-                diskProbe.command = ["bash", "-c", "df -Pk \"" + outputDir + "\""];
+                diskProbe.command = ["bash", "-c", "df -Pk " + shellQuote(outputDir)];
                 diskProbe.running = true;
             }
         }
@@ -1555,7 +1578,7 @@ Item {
         onTriggered: {
             var f = root.recordingFile;
             if (f && f.length > 0) {
-                var checkCmd = ["bash", "-c", "test -s '" + f + "' && echo ok || echo missing"];
+                var checkCmd = ["bash", "-c", "test -s " + shellQuote(f) + " && echo ok || echo missing"];
                 fileVerifyProc.command = checkCmd;
                 fileVerifyProc.running = true;
             } else {
