@@ -32,3 +32,10 @@ jobs:
       - name: Run Smoke Test Suite
         run: |
           bash tests/smoke.sh
+
+      # A directory name is not a command. The output directory reaches the
+      # service through the folder browser, and a path can contain a command
+      # substitution. This test proves -- against a real shell -- that nothing
+      # in it is executed.
+      - name: Run Shell Quoting Test
+        run: node tests/shell-quoting.test.js
