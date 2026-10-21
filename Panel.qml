@@ -7,6 +7,7 @@ import qs.Ui
 import qs.Commons
 import "."
 import "Config.js" as Config
+import "TextEntry.js" as TextEntry
 
 // pix.recast control panel — the settings popup anchored to the bar widget
 // (right click) or `omarchy-shell shell summon pix.recast`. Reads recording state
@@ -1095,12 +1096,24 @@ Panel {
                                 Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
                             }
                             TextField {
-                                // Gate on open(): a live editable TextField makes
-                                // QQuickTextInput query the clipboard on every
-                                // dataChanged (its canPaste bookkeeping), which on
-                                // Wayland blocks the shell on a foreign owner.
-                                readOnly: !root.opened
-                                text: root.cfg.streamUrl || ""
+                                id: streamUrlField
+                                /* Never editable. A native text input that is editable
+                                 * queries the clipboard on every clipboard-owner
+                                 * change, and that read is an unbounded, deadline-free
+                                 * transfer of foreign clipboard text on Wayland. The
+                                 * panel is open exactly when the user is typing,
+                                 * which is exactly when it would transfer -- so the
+                                 * gate has to stay shut. The field is read-only
+                                 * always, and the editing is driven from TextEntry. */
+                                readOnly: true
+                                selectByMouse: false
+                                maximumLength: 4096
+                                Binding {
+                                    target: streamUrlField
+                                    property: "text"
+                                    value: root.cfg.streamUrl || ""
+                                    when: !streamUrlField.activeFocus
+                                }
                                 placeholderText: "rtmp://push.tiktokcdn.com/live/"
                                 foreground: root.foreground
                                 accent: root.accent
@@ -1108,6 +1121,8 @@ Panel {
                                 font.pixelSize: Style.font.caption
                                 Layout.fillWidth: true
                                 onEditingFinished: root.setStreamField("streamUrl", text)
+                                onAccepted: root.setStreamField("streamUrl", text)
+                                Keys.onPressed: (e) => { TextEntry.handle(streamUrlField, e); }
                             }
 
                             Text {
@@ -1118,10 +1133,24 @@ Panel {
                                 Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
                             }
                             TextField {
-                                // See streamUrl: readOnly keeps Qt from querying
-                                // the clipboard while the panel is closed.
-                                readOnly: !root.opened
-                                text: root.cfg.streamKey || ""
+                                id: streamKeyField
+                                /* Never editable. A native text input that is editable
+                                 * queries the clipboard on every clipboard-owner
+                                 * change, and that read is an unbounded, deadline-free
+                                 * transfer of foreign clipboard text on Wayland. The
+                                 * panel is open exactly when the user is typing,
+                                 * which is exactly when it would transfer -- so the
+                                 * gate has to stay shut. The field is read-only
+                                 * always, and the editing is driven from TextEntry. */
+                                readOnly: true
+                                selectByMouse: false
+                                maximumLength: 4096
+                                Binding {
+                                    target: streamKeyField
+                                    property: "text"
+                                    value: root.cfg.streamKey || ""
+                                    when: !streamKeyField.activeFocus
+                                }
                                 password: true
                                 placeholderText: "live stream key"
                                 foreground: root.foreground
@@ -1130,6 +1159,8 @@ Panel {
                                 font.pixelSize: Style.font.caption
                                 Layout.fillWidth: true
                                 onEditingFinished: root.setStreamField("streamKey", text)
+                                onAccepted: root.setStreamField("streamKey", text)
+                                Keys.onPressed: (e) => { TextEntry.handle(streamKeyField, e); }
                             }
 
                             Text {
@@ -1743,21 +1774,36 @@ Panel {
                                 width: parent.width
                                 spacing: Style.space(6)
 
-                                TextField {
-                                    id: outputDirField
-                                    // See streamUrl: readOnly keeps Qt from
-                                    // querying the clipboard while closed.
-                                    readOnly: !root.opened
-                                    Layout.fillWidth: true
-                                    text: root.cfg.outputDir || ""
-                                    foreground: root.foreground
-                                    accent: root.accent
-                                    font.family: root.fontFamily
-                                    font.pixelSize: Style.font.caption
-                                    placeholderText: root.service ? root.service.outputDir
-                                        : (root.serviceState ? (root.serviceState.outputDir || "") : "")
-                                    onEditingFinished: root.setConfig("outputDir", text)
+                            TextField {
+                                id: outputDirField
+                                /* Never editable. A native text input that is editable
+                                 * queries the clipboard on every clipboard-owner
+                                 * change, and that read is an unbounded, deadline-free
+                                 * transfer of foreign clipboard text on Wayland. The
+                                 * panel is open exactly when the user is typing,
+                                 * which is exactly when it would transfer -- so the
+                                 * gate has to stay shut. The field is read-only
+                                 * always, and the editing is driven from TextEntry. */
+                                readOnly: true
+                                selectByMouse: false
+                                maximumLength: 4096
+                                Binding {
+                                    target: outputDirField
+                                    property: "text"
+                                    value: root.cfg.outputDir || ""
+                                    when: !outputDirField.activeFocus
                                 }
+                                Layout.fillWidth: true
+                                foreground: root.foreground
+                                accent: root.accent
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                                placeholderText: root.service ? root.service.outputDir
+                                    : (root.serviceState ? (root.serviceState.outputDir || "") : "")
+                                onEditingFinished: root.setConfig("outputDir", text)
+                                onAccepted: root.setConfig("outputDir", text)
+                                Keys.onPressed: (e) => { TextEntry.handle(outputDirField, e); }
+                            }
 
                                 Button {
                                     text: "Browse…"
@@ -1891,19 +1937,35 @@ Panel {
                                     font.pixelSize: Style.font.caption
                                     Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
                                 }
-                                TextField {
-                                    // See streamUrl: readOnly keeps Qt from
-                                    // querying the clipboard while closed.
-                                    readOnly: !root.opened
-                                    text: root.cfg.fileNameTemplate || ""
-                                    placeholderText: "screenrecording-%Y%m%d_%H%M%S"
-                                    foreground: root.foreground
-                                    accent: root.accent
-                                    font.family: root.fontFamily
-                                    font.pixelSize: Style.font.caption
-                                    Layout.fillWidth: true
-                                    onEditingFinished: root.setConfig("fileNameTemplate", text)
+                            TextField {
+                                id: fileNameTemplateField
+                                /* Never editable. A native text input that is editable
+                                 * queries the clipboard on every clipboard-owner
+                                 * change, and that read is an unbounded, deadline-free
+                                 * transfer of foreign clipboard text on Wayland. The
+                                 * panel is open exactly when the user is typing,
+                                 * which is exactly when it would transfer -- so the
+                                 * gate has to stay shut. The field is read-only
+                                 * always, and the editing is driven from TextEntry. */
+                                readOnly: true
+                                selectByMouse: false
+                                maximumLength: 4096
+                                Binding {
+                                    target: fileNameTemplateField
+                                    property: "text"
+                                    value: root.cfg.fileNameTemplate || ""
+                                    when: !fileNameTemplateField.activeFocus
                                 }
+                                placeholderText: "screenrecording-%Y%m%d_%H%M%S"
+                                foreground: root.foreground
+                                accent: root.accent
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                                Layout.fillWidth: true
+                                onEditingFinished: root.setConfig("fileNameTemplate", text)
+                                onAccepted: root.setConfig("fileNameTemplate", text)
+                                Keys.onPressed: (e) => { TextEntry.handle(fileNameTemplateField, e); }
+                            }
 
                                 Text {
                                     text: "Date folders"
